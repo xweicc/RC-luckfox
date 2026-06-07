@@ -6,6 +6,12 @@
 #include "audio.h"
 #include "rockiva.h"
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <poll.h>
+
 #define HAS_VO 0
 #if HAS_VO
 #include <rk_mpi_vo.h>
@@ -42,8 +48,11 @@
 #define RTMP_URL_1 "rtmp://127.0.0.1:1935/live/substream"
 #define RTMP_URL_2 "rtmp://127.0.0.1:1935/live/thirdstream"
 
+#define TCP_VIDEO_PORT_0 5100
+#define TCP_VIDEO_PORT_1 5101
+
 static int get_jpeg_cnt = 0;
-static int enable_ivs, enable_jpeg, enable_venc_0, enable_venc_1, enable_rtsp, enable_rtmp;
+static int enable_ivs, enable_jpeg, enable_venc_0, enable_venc_1, enable_rtsp, enable_rtmp, enable_tcp_video;
 static int g_enable_vo, g_vo_dev_id, g_vi_chn_id, enable_npu, enable_wrap, enable_osd;
 static int g_video_run_ = 1;
 static int pipe_id_ = 0;
@@ -59,6 +68,12 @@ static const char *tmp_rc_quality;
 static pthread_t vi_thread_1, venc_thread_0, venc_thread_1, venc_thread_2, jpeg_venc_thread_id,
     vpss_thread_rgb, cycle_snapshot_thread_id, get_nn_update_osd_thread_id, get_vi_2_send_thread,
     get_ivs_result_thread;
+static pthread_t tcp_video_thread_0, tcp_video_thread_1;
+static volatile int tcp_video_client_fd[2] = {-1, -1};
+static int tcp_video_server_fd[2] = {-1, -1};
+
+// Forward declarations for TCP video server
+static int tcp_video_send_frame(int stream_id, void *data, unsigned int len);
 
 static MPP_CHN_S vi_chn, vpss_bgr_chn, vpss_rotate_chn, vo_chn, vpss_out_chn[4], venc_chn, ivs_chn;
 static VO_DEV VoLayer = RK3588_VOP_LAYER_CLUSTER0;
@@ -133,6 +148,8 @@ static void *rkipc_get_venc_0(void *arg) {
 			// stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS,
 			// stFrame.pstPack->DataType.enH264EType);
 			rkipc_rtsp_write_video_frame(0, data, stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS);
+			if (enable_tcp_video)
+				tcp_video_send_frame(0, data, stFrame.pstPack->u32Len);
 			if ((stFrame.pstPack->DataType.enH264EType == H264E_NALU_IDRSLICE) ||
 			    (stFrame.pstPack->DataType.enH264EType == H264E_NALU_ISLICE) ||
 			    (stFrame.pstPack->DataType.enH265EType == H265E_NALU_IDRSLICE) ||
@@ -291,6 +308,8 @@ static void *rkipc_get_venc_1(void *arg) {
 			// stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS,
 			// stFrame.pstPack->DataType.enH264EType);
 			rkipc_rtsp_write_video_frame(1, data, stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS);
+			if (enable_tcp_video)
+				tcp_video_send_frame(1, data, stFrame.pstPack->u32Len);
 			if ((stFrame.pstPack->DataType.enH264EType == H264E_NALU_IDRSLICE) ||
 			    (stFrame.pstPack->DataType.enH264EType == H264E_NALU_ISLICE) ||
 			    (stFrame.pstPack->DataType.enH265EType == H265E_NALU_IDRSLICE) ||
@@ -320,6 +339,139 @@ static void *rkipc_get_venc_1(void *arg) {
 		free(stFrame.pstPack);
 
 	return 0;
+}
+
+// ========== TCP Video Server ==========
+static void *tcp_video_accept_thread(void *arg) {
+	int stream_id = (int)(intptr_t)arg;
+	char thread_name[16];
+	snprintf(thread_name, sizeof(thread_name), "TcpVideo%d", stream_id);
+	prctl(PR_SET_NAME, thread_name, 0, 0, 0);
+	LOG_INFO("TCP video accept thread started for stream %d on port %d\n", stream_id,
+	         stream_id == 0 ? TCP_VIDEO_PORT_0 : TCP_VIDEO_PORT_1);
+
+	while (g_video_run_) {
+		struct sockaddr_in client_addr;
+		socklen_t addr_len = sizeof(client_addr);
+		int client_fd = accept(tcp_video_server_fd[stream_id],
+		                       (struct sockaddr *)&client_addr, &addr_len);
+		if (client_fd < 0) {
+			if (g_video_run_ && errno != EINTR)
+				LOG_ERROR("TCP video accept error on stream %d: %s\n", stream_id, strerror(errno));
+			continue;
+		}
+
+		// Set TCP_NODELAY for low latency
+		int flag = 1;
+		setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+		// Set send buffer size
+		int sndbuf = 512 * 1024;
+		setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+		// Disconnect old connection, keep only the new one
+		int old_fd = __atomic_exchange_n(&tcp_video_client_fd[stream_id], client_fd, __ATOMIC_SEQ_CST);
+		if (old_fd >= 0) {
+			LOG_INFO("TCP video.%d: disconnecting old client\n", stream_id);
+			close(old_fd);
+		}
+		LOG_INFO("TCP video.%d: new client connected from %s:%d\n", stream_id,
+		         inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+	}
+	return NULL;
+}
+
+static int tcp_video_send_frame(int stream_id, void *data, unsigned int len) {
+	int fd = __atomic_load_n(&tcp_video_client_fd[stream_id], __ATOMIC_ACQUIRE);
+	if (fd < 0)
+		return 0;
+
+	// Use poll with timeout to avoid blocking VENC thread when client is slow
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = POLLOUT;
+	int ret = poll(&pfd, 1, 100); // 100ms timeout
+	if (ret <= 0) {
+		// Timeout or error, disconnect client to avoid blocking pipeline
+		LOG_INFO("TCP video.%d client too slow or disconnected (poll ret=%d, errno=%d: %s)\n",
+		         stream_id, ret, errno, strerror(errno));
+		int expected = fd;
+		__atomic_compare_exchange_n(&tcp_video_client_fd[stream_id], &expected, -1,
+		                            0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
+		if (expected == fd)
+			close(fd);
+		return -1;
+	}
+
+	// Send raw H.265 Annex B stream directly (no length header)
+	// Client splits NAL units by scanning start code 0x00000001
+	ssize_t written = send(fd, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+	if (written < (ssize_t)len) {
+		// Send failed, client disconnected
+		LOG_INFO("TCP video.%d client disconnected (send ret=%zd, errno=%d: %s)\n",
+		         stream_id, written, errno, strerror(errno));
+		int expected = fd;
+		__atomic_compare_exchange_n(&tcp_video_client_fd[stream_id], &expected, -1,
+		                            0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
+		if (expected == fd)
+			close(fd);
+		return -1;
+	}
+	return 0;
+}
+
+static int tcp_video_server_init() {
+	for (int i = 0; i < 2; i++) {
+		int port = (i == 0) ? TCP_VIDEO_PORT_0 : TCP_VIDEO_PORT_1;
+		int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (server_fd < 0) {
+			LOG_ERROR("TCP video socket create failed for stream %d: %s\n", i, strerror(errno));
+			return -1;
+		}
+
+		int reuse = 1;
+		setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+		struct sockaddr_in addr;
+		memset(&addr, 0, sizeof(addr));
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = INADDR_ANY;
+		addr.sin_port = htons(port);
+
+		if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+			LOG_ERROR("TCP video bind port %d failed: %s\n", port, strerror(errno));
+			close(server_fd);
+			return -1;
+		}
+
+		if (listen(server_fd, 1) < 0) {
+			LOG_ERROR("TCP video listen port %d failed: %s\n", port, strerror(errno));
+			close(server_fd);
+			return -1;
+		}
+
+		tcp_video_server_fd[i] = server_fd;
+		LOG_INFO("TCP video server listening on port %d for video.%d\n", port, i);
+	}
+
+	pthread_create(&tcp_video_thread_0, NULL, tcp_video_accept_thread, (void *)(intptr_t)0);
+	pthread_create(&tcp_video_thread_1, NULL, tcp_video_accept_thread, (void *)(intptr_t)1);
+	return 0;
+}
+
+static void tcp_video_server_deinit() {
+	for (int i = 0; i < 2; i++) {
+		if (tcp_video_server_fd[i] >= 0) {
+			close(tcp_video_server_fd[i]);
+			tcp_video_server_fd[i] = -1;
+		}
+		int fd = __atomic_exchange_n(&tcp_video_client_fd[i], -1, __ATOMIC_SEQ_CST);
+		if (fd >= 0)
+			close(fd);
+	}
+	if (tcp_video_thread_0)
+		pthread_join(tcp_video_thread_0, NULL);
+	if (tcp_video_thread_1)
+		pthread_join(tcp_video_thread_1, NULL);
 }
 
 static void *rkipc_get_jpeg(void *arg) {
@@ -3164,9 +3316,10 @@ int rk_video_init() {
 	enable_venc_1 = rk_param_get_int("video.source:enable_venc_1", 1);
 	enable_rtsp = rk_param_get_int("video.source:enable_rtsp", 1);
 	enable_rtmp = rk_param_get_int("video.source:enable_rtmp", 1);
+	enable_tcp_video = rk_param_get_int("video.source:enable_tcp_video", 1);
 	LOG_INFO("enable_jpeg is %d, enable_venc_0 is %d, enable_venc_1 is %d, enable_rtsp is %d, "
-	         "enable_rtmp is %d\n",
-	         enable_jpeg, enable_venc_0, enable_venc_1, enable_rtsp, enable_rtmp);
+	         "enable_rtmp is %d, enable_tcp_video is %d\n",
+	         enable_jpeg, enable_venc_0, enable_venc_1, enable_rtsp, enable_rtmp, enable_tcp_video);
 
 	g_vi_chn_id = rk_param_get_int("video.source:vi_chn_id", 0);
 	g_enable_vo = rk_param_get_int("video.source:enable_vo", 1);
@@ -3183,6 +3336,8 @@ int rk_video_init() {
 		ret |= rkipc_rtsp_init(RTSP_URL_0, RTSP_URL_1, NULL);
 	if (enable_rtmp)
 		ret |= rkipc_rtmp_init();
+	if (enable_tcp_video)
+		ret |= tcp_video_server_init();
 	if (enable_venc_0)
 		ret |= rkipc_pipe_0_init();
 	if (enable_venc_1)
@@ -3236,6 +3391,8 @@ int rk_video_deinit() {
 		ret |= rkipc_pipe_jpeg_deinit();
 	}
 	ret |= rkipc_vi_dev_deinit();
+	if (enable_tcp_video)
+		tcp_video_server_deinit();
 	if (enable_rtmp)
 		ret |= rkipc_rtmp_deinit();
 	if (enable_rtsp)
