@@ -54,7 +54,7 @@
 /**********USB**********/
 &usbdrd_dwc3 {
 	status = "okay";
-	dr_mode = "peripheral";
+	dr_mode = "host";
 };
 
 /**********SPI**********/
@@ -94,8 +94,44 @@
 };
 
 /**********PWM**********/
+/* PWM0_M1 */
+&pwm0 {
+	status = "okay";
+	pinctrl-0 = <&pwm0m1_pins>;
+};
+
 /* PWM1_M0 */
 &pwm1 {
 	status = "disabled";
+};
+
+/* PWM2_M2 */
+&pwm2 {
+	status = "okay";
+	pinctrl-0 = <&pwm2m2_pins>;
+};
+
+/* PWM8_M1 */
+&pwm8 {
+	status = "okay";
+	pinctrl-0 = <&pwm8m1_pins>;
+};
+
+/* PWM9_M1 */
+&pwm9 {
+	status = "okay";
+	pinctrl-0 = <&pwm9m1_pins>;
+};
+
+/* PWM10_M1 */
+&pwm10 {
+	status = "okay";
+	pinctrl-0 = <&pwm10m1_pins>;
+};
+
+/* PWM11_M1 */
+&pwm11 {
+	status = "okay";
+	pinctrl-0 = <&pwm11m1_pins>;
 };
 
