@@ -104,7 +104,7 @@ export RK_BUILD_APP_TO_OEM_PARTITION=y
 export RK_ENABLE_ROCKCHIP_TEST=y
 
 # enable rockchip wifi
-export RK_ENABLE_WIFI=y
+# export RK_ENABLE_WIFI=y
 
 # config wifi ssid and passwd
 export LF_WIFI_SSID="Your wifi ssid"
