@@ -832,16 +832,22 @@ static void *ntp_client_thread() {
 
 void rk_network_init(rk_network_cb func) { // func_cb func
 	g_network_run_ = 1;
-	pthread_attr_t attr;
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-	pthread_t Net_trd;
-	if (pthread_create(&Net_trd, &attr, rk_net_proc, NULL) != 0) {
-		LOG_INFO("Creat thread failed!\n");
-	}
 	if (func)
 		rk_cb = func;
+
+	if (rk_param_get_int("network.dhcp:enable", 0)) {
+		pthread_attr_t attr;
+		pthread_attr_init(&attr);
+		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+		pthread_t Net_trd;
+		if (pthread_create(&Net_trd, &attr, rk_net_proc, NULL) != 0) {
+			LOG_INFO("Creat thread failed!\n");
+		}
+	} else {
+		LOG_INFO("network dhcp monitor disabled\n");
+	}
 
 	if (g_ntp_signal)
 		rk_signal_destroy(g_ntp_signal);
@@ -867,7 +873,8 @@ void rk_network_deinit() { // pthread_t pthid
 			g_ntp_signal = NULL;
 		}
 	}
-	close(netlink_fd);
+	if (netlink_fd > 0)
+		close(netlink_fd);
 }
 
 int rk_wifi_power_get(int *on) {

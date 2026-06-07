@@ -41,7 +41,7 @@ network_init() {
 	else
 		echo $ethaddr1 >/data/ethaddr.txt
 	fi
-	ifconfig eth0 up && udhcpc -i eth0 >/dev/null 2>&1
+	ifconfig eth0 192.168.1.1 netmask 255.255.255.0 up
 }
 
 post_chk() {
@@ -106,9 +106,9 @@ post_chk() {
 		echo "Error: not found rkipc.ini !!!"
 		exit -1
 	fi
-	#if [ ! -f "$rkipc_ini" ]; then
+	if [ ! -f "$rkipc_ini" ]; then
 		cp $default_rkipc_ini $rkipc_ini -f
-	#fi
+	fi
 
 	if [ ! -f "/userdata/image.bmp" ]; then
 		cp -fa /oem/usr/share/image.bmp /userdata/
@@ -121,6 +121,16 @@ post_chk() {
 	fi
 }
 
+usb_net_chk() {
+	while true; do
+		udhcpc -i eth1 -T 1 -A 0 -b -q
+		if [ $? -eq 0 ]; then
+			break
+		fi
+		sleep 1
+	done
+}
+
 rcS
 
 ulimit -c unlimited
@@ -130,3 +140,4 @@ echo "/data/core-%p-%e" >/proc/sys/kernel/core_pattern
 echo 1 >/proc/sys/vm/overcommit_memory
 
 post_chk &
+usb_net_chk &
