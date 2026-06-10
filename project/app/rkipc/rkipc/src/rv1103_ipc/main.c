@@ -169,18 +169,34 @@ int main(int argc, char **argv) {
 	rk_video_init();
 	if (rk_param_get_int("audio.0:enable", 0))
 		rkipc_audio_init();
-	rkipc_server_init();
-	rk_storage_init();
-	pthread_create(&key_chk, NULL, wait_key_event, NULL);
+	
+	// 通过配置控制 Socket Server（默认启用，用于 Web/APP 管理）
+	if (rk_param_get_int("system:enable_server", 1))
+		rkipc_server_init();
+	
+	// 通过配置控制存储模块（所有 storage.X:enable=0 时跳过初始化）
+	if (rk_param_get_int("storage.0:enable", 0) || 
+	    rk_param_get_int("storage.1:enable", 0) || 
+	    rk_param_get_int("storage.2:enable", 0))
+		rk_storage_init();
+	
+	// 通过配置控制键盘事件监听（默认禁用，除非有物理按键）
+	if (rk_param_get_int("system:enable_key_event", 0))
+		pthread_create(&key_chk, NULL, wait_key_event, NULL);
 
 	while (g_main_run_) {
 		usleep(1000 * 1000);
 	}
 
 	// deinit
-	pthread_join(key_chk, NULL);
-	rk_storage_deinit();
-	rkipc_server_deinit();
+	if (rk_param_get_int("system:enable_key_event", 0))
+		pthread_join(key_chk, NULL);
+	if (rk_param_get_int("storage.0:enable", 0) || 
+	    rk_param_get_int("storage.1:enable", 0) || 
+	    rk_param_get_int("storage.2:enable", 0))
+		rk_storage_deinit();
+	if (rk_param_get_int("system:enable_server", 1))
+		rkipc_server_deinit();
 	rk_system_deinit();
 	rk_video_deinit();
 	if (rk_param_get_int("video.source:enable_aiq", 1))

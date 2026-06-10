@@ -121,16 +121,6 @@ post_chk() {
 	fi
 }
 
-usb_net_chk() {
-	while true; do
-		udhcpc -i eth1 -T 1 -A 0 -b -q
-		if [ $? -eq 0 ]; then
-			break
-		fi
-		sleep 1
-	done
-}
-
 rcS
 
 ulimit -c unlimited
@@ -140,4 +130,3 @@ echo "/data/core-%p-%e" >/proc/sys/kernel/core_pattern
 echo 1 >/proc/sys/vm/overcommit_memory
 
 post_chk &
-usb_net_chk &
