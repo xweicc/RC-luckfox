@@ -17,14 +17,20 @@ CC := $(RK_APP_CROSS)-gcc
 STRIP := $(RK_APP_CROSS)-strip
 
 CFLAGS += -Wall -O2
-LDFLAGS += -lpthread
+LDFLAGS += -lpthread -lm
 
-SRCS := source/remote_control.c
+# ALSA library (libasound) 用于音频采集和播放
+# 头文件在 buildroot sysroot，库在 rootfs output
+RK_BUILDROOT_SYSROOT := $(shell ls -d $(CURDIR)/../../../sysdrv/source/buildroot/buildroot-*/output/host/arm-buildroot-linux-uclibcgnueabihf/sysroot 2>/dev/null | head -1)
+ifneq ($(RK_BUILDROOT_SYSROOT),)
+    CFLAGS += -I$(RK_BUILDROOT_SYSROOT)/usr/include
+endif
+RK_ROOTFS_LIB := $(RK_PROJECT_OUTPUT)/rootfs_uclibc_$(RK_CHIP)/usr/lib
+LDFLAGS += -L$(RK_ROOTFS_LIB) -lasound
+
+SRCS := source/remote_control.c source/ml307c.c source/audio.c
 
 PKG_TARGET := remote_control-build
-
-all: $(PKG_TARGET)
-	@echo "build $(PKG_NAME) done"
 
 remote_control-build:
 	@mkdir -p $(PKG_BIN)/bin

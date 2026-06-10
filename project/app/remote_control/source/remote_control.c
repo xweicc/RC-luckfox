@@ -20,6 +20,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include "ml307c.h"
+#include "audio.h"
 
 
 /* ======================== Configuration ======================== */
@@ -80,12 +82,12 @@ typedef struct {
 typedef struct {
     uint8_t  magic[2];     /* 0x5A, 0xA5 */
     uint8_t  type;         /* 0x03 */
-    uint8_t  length;       /* 25 */
-    double   latitude;     /* IEEE 754 double, e.g. 30.555397 */
-    double   longitude;    /* IEEE 754 double, e.g. 104.276083 */
-    float    speed;        /* km/h, IEEE 754 float */
+    uint8_t  length;       /* 30 */
+    char     latitude[12]; /* ASCII string, e.g. "39.904200" */
+    char     longitude[12];/* ASCII string, e.g. "116.407400" */
+    uint8_t  speed;        /* km/h (0~255) */
     uint8_t  checksum;     /* XOR of preceding bytes */
-} GpsPacket;               /* 25 bytes */
+} GpsPacket;               /* 30 bytes */
 #pragma pack(pop)
 
 /* ======================== Global State ======================== */
@@ -338,19 +340,21 @@ static void build_telemetry(TelemetryPacket *pkt, uint32_t voltage_mv)
     pkt->magic[1]   = MAGIC_1;
     pkt->type       = TYPE_TELE;
     pkt->length     = sizeof(TelemetryPacket);
-    pkt->signal     = 0;    /* Not implemented */
+    pkt->signal     = ml307c_get_signal();  /* Get signal strength from ML307C */
     pkt->voltage_mv = voltage_mv;
     pkt->checksum   = xor_checksum((const uint8_t *)pkt, sizeof(TelemetryPacket) - 1);
 }
 
-static void build_gps(GpsPacket *pkt, double lat, double lon, float spd)
+static void build_gps(GpsPacket *pkt, const char *lat, const char *lon, uint8_t spd)
 {
     pkt->magic[0]   = MAGIC_0;
     pkt->magic[1]   = MAGIC_1;
     pkt->type       = TYPE_GPS;
     pkt->length     = sizeof(GpsPacket);
-    pkt->latitude   = lat;
-    pkt->longitude  = lon;
+    memset(pkt->latitude, 0, sizeof(pkt->latitude));
+    memset(pkt->longitude, 0, sizeof(pkt->longitude));
+    strncpy(pkt->latitude, lat, sizeof(pkt->latitude) - 1);
+    strncpy(pkt->longitude, lon, sizeof(pkt->longitude) - 1);
     pkt->speed      = spd;
     pkt->checksum   = xor_checksum((const uint8_t *)pkt, sizeof(GpsPacket) - 1);
 }
@@ -378,8 +382,8 @@ static int parse_control(const uint8_t *buf, int len)
             static int64_t last_print_ms = 0;
             int64_t now = time_ms();
             if (now - last_print_ms >= 2000) {
-                printf("[CTRL] throttle=%d, steering=%d, light=%d\n",
-                       g_throttle, g_steering, g_light);
+                // printf("[CTRL] throttle=%d, steering=%d, light=%d\n",
+                //        g_throttle, g_steering, g_light);
                 last_print_ms = now;
             }
         }
@@ -396,8 +400,12 @@ static int tcp_init(void)
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); return -1; }
 
+    /* Allow socket reuse for quick restart */
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -406,6 +414,7 @@ static int tcp_init(void)
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "[TCP] port %d already in use. Kill old process: killall -9 remote_control\n", TCP_PORT);
         perror("bind"); close(fd); return -1;
     }
     if (listen(fd, 1) < 0) {
@@ -464,10 +473,21 @@ int main(void)
     }
     set_defaults();
 
+    /* Initialize ML307C (RNDIS + GNSS) */
+    if (ml307c_init() < 0)
+        fprintf(stderr, "ML307C init failed, GPS will use default\n");
+
+    /* Initialize Audio (TCP 5102) */
+    if (audio_init() < 0)
+        fprintf(stderr, "Audio init failed, intercom will be unavailable\n");
+    else
+        audio_start();
+
     /* Initialize TCP server */
     g_server_fd = tcp_init();
     if (g_server_fd < 0) {
         pwm_deinit();
+        ml307c_deinit();
         return 1;
     }
 
@@ -536,20 +556,48 @@ int main(void)
             last_tele_ms = time_ms();
         }
 
-        /* Send GPS every 2s (test data) */
+        /* Send GPS every 2s */
         if (g_client_fd >= 0 && time_ms() - last_gps_ms >= GPS_INTERVAL_MS) {
             GpsPacket gps;
-            build_gps(&gps, 30.555397, 104.276083, 12.3f);
+            ml307c_gps_data_t gpsd;
+            if (ml307c_get_gps(&gpsd)) {
+                char lat[12], lon[12];
+                snprintf(lat, sizeof(lat), "%.6f", gpsd.latitude);
+                snprintf(lon, sizeof(lon), "%.6f", gpsd.longitude);
+                uint8_t spd = (gpsd.speed_kmh > 255.0f) ? 255 :
+                              (uint8_t)(gpsd.speed_kmh + 0.5f);
+                build_gps(&gps, lat, lon, spd);
+            } else {
+                build_gps(&gps, "0.000000", "0.000000", 0);
+            }
             if (send(g_client_fd, &gps, sizeof(gps), MSG_NOSIGNAL) < 0)
                 disconnect_client();
             last_gps_ms = time_ms();
         }
     }
 
-    /* Cleanup */
+    /* Cleanup - order matters: stop threads first */
+    printf("\n[MAIN] shutting down...\n");
     disconnect_client();
-    close(g_server_fd);
+    
+    /* Stop audio threads */
+    audio_stop();
+    
+    /* Close server fd to unblock select() if waiting */
+    if (g_server_fd >= 0) {
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
+    
+    /* Stop ML307C threads (monitor + reader) */
+    ml307c_deinit();
+    
+    /* Cleanup audio */
+    audio_cleanup();
+    
+    /* Cleanup PWM */
     pwm_deinit();
-    printf("Server stopped\n");
+    
+    printf("[MAIN] Server stopped\n");
     return 0;
 }
