@@ -11,6 +11,12 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <rk_mpi_vdec.h>
 
 #define HAS_VO 0
 #if HAS_VO
@@ -50,6 +56,17 @@
 
 #define TCP_VIDEO_PORT_0 5100
 #define TCP_VIDEO_PORT_1 5101
+#define TCP_VIDEO_PORT_2 5105
+#define TCP_CONTROL_PORT 5104
+#define TCP_VIDEO_STREAM_COUNT 3
+
+// USB Camera
+#define USB_VENC_CHN VIDEO_PIPE_3
+#define VDEC_CHN_ID  0
+#define USB_CAMERA_DEFAULT_WIDTH  1280
+#define USB_CAMERA_DEFAULT_HEIGHT 720
+#define USB_CAMERA_DEFAULT_FPS    30
+#define USB_CAMERA_BUF_COUNT      4
 
 static int get_jpeg_cnt = 0;
 static int enable_ivs, enable_jpeg, enable_venc_0, enable_venc_1, enable_rtsp, enable_rtmp, enable_tcp_video;
@@ -68,12 +85,30 @@ static const char *tmp_rc_quality;
 static pthread_t vi_thread_1, venc_thread_0, venc_thread_1, venc_thread_2, jpeg_venc_thread_id,
     vpss_thread_rgb, cycle_snapshot_thread_id, get_nn_update_osd_thread_id, get_vi_2_send_thread,
     get_ivs_result_thread;
-static pthread_t tcp_video_thread_0, tcp_video_thread_1;
-static volatile int tcp_video_client_fd[2] = {-1, -1};
-static int tcp_video_server_fd[2] = {-1, -1};
+static pthread_t tcp_video_thread_0, tcp_video_thread_1, tcp_video_thread_2;
+static volatile int tcp_video_client_fd[TCP_VIDEO_STREAM_COUNT] = {-1, -1, -1};
+static int tcp_video_server_fd[TCP_VIDEO_STREAM_COUNT] = {-1, -1, -1};
+static pthread_t tcp_control_thread;
+static volatile int tcp_control_client_fd = -1;
+static int tcp_control_server_fd = -1;
+// Lazy VENC bind state
+static volatile int pipe_0_bound = 0, pipe_1_bound = 0;
+// USB Camera state
+static int usb_camera_fd_ = -1;
+static int usb_camera_available_ = 0;
+static int usb_camera_streaming_ = 0;
+static int usb_cam_width_ = USB_CAMERA_DEFAULT_WIDTH;
+static int usb_cam_height_ = USB_CAMERA_DEFAULT_HEIGHT;
+static int usb_cam_fps_ = USB_CAMERA_DEFAULT_FPS;
+static void *usb_v4l2_buffers_[USB_CAMERA_BUF_COUNT];
+static size_t usb_v4l2_buffer_lengths_[USB_CAMERA_BUF_COUNT];
+static pthread_t usb_camera_thread_;
 
-// Forward declarations for TCP video server
+// Forward declarations
 static int tcp_video_send_frame(int stream_id, void *data, unsigned int len);
+static int usb_camera_init(void);
+static void usb_camera_deinit(void);
+static void *usb_camera_encode_thread(void *arg);
 
 static MPP_CHN_S vi_chn, vpss_bgr_chn, vpss_rotate_chn, vo_chn, vpss_out_chn[4], venc_chn, ivs_chn;
 static VO_DEV VoLayer = RK3588_VOP_LAYER_CLUSTER0;
@@ -127,59 +162,93 @@ static void *get_vi_send_vo(void *arg) {
 }
 #endif
 
-static void *rkipc_get_venc_0(void *arg) {
-	LOG_DEBUG("#Start %s thread, arg:%p\n", __func__, arg);
-	prctl(PR_SET_NAME, "RkipcVenc0", 0, 0, 0);
+// Lazy VENC encoding: only bind VI->VENC and encode when TCP client is connected
+static void *rkipc_get_venc_lazy(void *arg) {
+	int stream_id = (int)(intptr_t)arg;
+	char thread_name[16];
+	snprintf(thread_name, sizeof(thread_name), "RkipcVenc%d", stream_id);
+	prctl(PR_SET_NAME, thread_name, 0, 0, 0);
+	LOG_INFO("Lazy VENC thread started for stream %d\n", stream_id);
+
 	VENC_STREAM_S stFrame;
-	VI_CHN_STATUS_S stChnStatus;
-	int loopCount = 0;
 	int ret = 0;
-	// FILE *fp = fopen("/data/venc.h265", "wb");
+	int bound = 0;
 	stFrame.pstPack = malloc(sizeof(VENC_PACK_S));
 
+	// Local channel structs for bind/unbind (thread-safe, no shared state)
+	MPP_CHN_S local_vi, local_venc;
+	local_vi.enModId = RK_ID_VI;
+	local_vi.s32DevId = 0;
+	local_vi.s32ChnId = stream_id;
+	local_venc.enModId = RK_ID_VENC;
+	local_venc.s32DevId = 0;
+	local_venc.s32ChnId = stream_id;
+
+	volatile int *bound_flag = (stream_id == 0) ? &pipe_0_bound : &pipe_1_bound;
+
 	while (g_video_run_) {
-		// 5.get the frame
-		ret = RK_MPI_VENC_GetStream(VIDEO_PIPE_0, &stFrame, 2500);
+		int client_connected = (__atomic_load_n(&tcp_video_client_fd[stream_id], __ATOMIC_ACQUIRE) >= 0);
+
+		if (client_connected && !bound) {
+			// TCP client connected: bind VI -> VENC to start encoding
+			ret = RK_MPI_SYS_Bind(&local_vi, &local_venc);
+			if (ret) {
+				LOG_ERROR("VENC.%d: Bind VI->VENC failed ret=%#x\n", stream_id, ret);
+				usleep(100000);
+				continue;
+			}
+			bound = 1;
+			*bound_flag = 1;
+			// Reset VENC to clear stale buffers and force IDR on first frame
+			RK_MPI_VENC_ResetChn(stream_id);
+			RK_MPI_VENC_RequestIDR(stream_id, RK_TRUE);
+			LOG_INFO("VENC.%d: VI->VENC bound, encoding started (IDR requested)\n", stream_id);
+		} else if (!client_connected && bound) {
+			// TCP client disconnected: unbind to stop encoding
+			ret = RK_MPI_SYS_UnBind(&local_vi, &local_venc);
+			if (ret)
+				LOG_ERROR("VENC.%d: Unbind VI->VENC failed ret=%#x\n", stream_id, ret);
+			bound = 0;
+			*bound_flag = 0;
+			LOG_INFO("VENC.%d: VI->VENC unbound, encoding stopped\n", stream_id);
+			usleep(50000);
+			continue;
+		} else if (!bound) {
+			// No client, not bound: sleep and check again
+			usleep(50000);
+			continue;
+		}
+
+		// Get encoded frame from VENC
+		ret = RK_MPI_VENC_GetStream(stream_id, &stFrame, 2500);
 		if (ret == RK_SUCCESS) {
 			void *data = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
-			// fwrite(data, 1, stFrame.pstPack->u32Len, fp);
-			// fflush(fp);
-			// LOG_DEBUG("Count:%d, Len:%d, PTS is %" PRId64", enH264EType is %d\n", loopCount,
-			// stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS,
-			// stFrame.pstPack->DataType.enH264EType);
-			rkipc_rtsp_write_video_frame(0, data, stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS);
+			// Send to TCP client
 			if (enable_tcp_video)
-				tcp_video_send_frame(0, data, stFrame.pstPack->u32Len);
-			if ((stFrame.pstPack->DataType.enH264EType == H264E_NALU_IDRSLICE) ||
-			    (stFrame.pstPack->DataType.enH264EType == H264E_NALU_ISLICE) ||
-			    (stFrame.pstPack->DataType.enH265EType == H265E_NALU_IDRSLICE) ||
-			    (stFrame.pstPack->DataType.enH265EType == H265E_NALU_ISLICE)) {
-				rk_storage_write_video_frame(0, data, stFrame.pstPack->u32Len,
-				                             stFrame.pstPack->u64PTS, 1);
-				if (enable_rtmp)
-					rk_rtmp_write_video_frame(0, data, stFrame.pstPack->u32Len,
-					                          stFrame.pstPack->u64PTS, 1);
-			} else {
-				rk_storage_write_video_frame(0, data, stFrame.pstPack->u32Len,
-				                             stFrame.pstPack->u64PTS, 0);
-				if (enable_rtmp)
-					rk_rtmp_write_video_frame(0, data, stFrame.pstPack->u32Len,
-					                          stFrame.pstPack->u64PTS, 0);
-			}
-			// 7.release the frame
-			ret = RK_MPI_VENC_ReleaseStream(VIDEO_PIPE_0, &stFrame);
-			if (ret != RK_SUCCESS) {
+				tcp_video_send_frame(stream_id, data, stFrame.pstPack->u32Len);
+			// Write to storage
+			int is_key = (stFrame.pstPack->DataType.enH265EType == H265E_NALU_IDRSLICE) ||
+			             (stFrame.pstPack->DataType.enH265EType == H265E_NALU_ISLICE) ||
+			             (stFrame.pstPack->DataType.enH264EType == H264E_NALU_IDRSLICE) ||
+			             (stFrame.pstPack->DataType.enH264EType == H264E_NALU_ISLICE);
+			rk_storage_write_video_frame(stream_id, data, stFrame.pstPack->u32Len,
+			                             stFrame.pstPack->u64PTS, is_key);
+
+			ret = RK_MPI_VENC_ReleaseStream(stream_id, &stFrame);
+			if (ret != RK_SUCCESS)
 				LOG_ERROR("RK_MPI_VENC_ReleaseStream fail %x\n", ret);
-			}
-			loopCount++;
 		} else {
-			LOG_ERROR("RK_MPI_VENC_GetStream timeout %x\n", ret);
+			LOG_ERROR("VENC.%d: GetStream error ret=%#x\n", stream_id, ret);
 		}
+	}
+
+	// Cleanup: unbind if still bound
+	if (bound) {
+		RK_MPI_SYS_UnBind(&local_vi, &local_venc);
+		*bound_flag = 0;
 	}
 	if (stFrame.pstPack)
 		free(stFrame.pstPack);
-	// if (fp)
-	// fclose(fp);
 
 	return 0;
 }
@@ -290,56 +359,8 @@ static void *rkipc_get_vi_draw_send_venc(void *arg) {
 	return 0;
 }
 
-static void *rkipc_get_venc_1(void *arg) {
-	LOG_DEBUG("#Start %s thread, arg:%p\n", __func__, arg);
-	prctl(PR_SET_NAME, "RkipcVenc1", 0, 0, 0);
-	VENC_STREAM_S stFrame;
-	VI_CHN_STATUS_S stChnStatus;
-	int loopCount = 0;
-	int ret = 0;
-	stFrame.pstPack = malloc(sizeof(VENC_PACK_S));
-
-	while (g_video_run_) {
-		// 5.get the frame
-		ret = RK_MPI_VENC_GetStream(VIDEO_PIPE_1, &stFrame, 2500);
-		if (ret == RK_SUCCESS) {
-			void *data = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
-			// LOG_INFO("Count:%d, Len:%d, PTS is %" PRId64", enH264EType is %d\n", loopCount,
-			// stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS,
-			// stFrame.pstPack->DataType.enH264EType);
-			rkipc_rtsp_write_video_frame(1, data, stFrame.pstPack->u32Len, stFrame.pstPack->u64PTS);
-			if (enable_tcp_video)
-				tcp_video_send_frame(1, data, stFrame.pstPack->u32Len);
-			if ((stFrame.pstPack->DataType.enH264EType == H264E_NALU_IDRSLICE) ||
-			    (stFrame.pstPack->DataType.enH264EType == H264E_NALU_ISLICE) ||
-			    (stFrame.pstPack->DataType.enH265EType == H265E_NALU_IDRSLICE) ||
-			    (stFrame.pstPack->DataType.enH265EType == H265E_NALU_ISLICE)) {
-				rk_storage_write_video_frame(1, data, stFrame.pstPack->u32Len,
-				                             stFrame.pstPack->u64PTS, 1);
-				if (enable_rtmp)
-					rk_rtmp_write_video_frame(1, data, stFrame.pstPack->u32Len,
-					                          stFrame.pstPack->u64PTS, 1);
-			} else {
-				rk_storage_write_video_frame(1, data, stFrame.pstPack->u32Len,
-				                             stFrame.pstPack->u64PTS, 0);
-				if (enable_rtmp)
-					rk_rtmp_write_video_frame(1, data, stFrame.pstPack->u32Len,
-					                          stFrame.pstPack->u64PTS, 0);
-			}
-			// 7.release the frame
-			ret = RK_MPI_VENC_ReleaseStream(VIDEO_PIPE_1, &stFrame);
-			if (ret != RK_SUCCESS)
-				LOG_ERROR("RK_MPI_VENC_ReleaseStream fail %x\n", ret);
-			loopCount++;
-		} else {
-			LOG_ERROR("RK_MPI_VENC_GetStream timeout %x\n", ret);
-		}
-	}
-	if (stFrame.pstPack)
-		free(stFrame.pstPack);
-
-	return 0;
-}
+// rkipc_get_venc_1 used by NPU draw path (rkipc_get_vi_draw_send_venc sends to VENC.1)
+// For TCP lazy encoding, we reuse rkipc_get_venc_lazy with stream_id=1
 
 // ========== TCP Video Server ==========
 static void *tcp_video_accept_thread(void *arg) {
@@ -348,7 +369,7 @@ static void *tcp_video_accept_thread(void *arg) {
 	snprintf(thread_name, sizeof(thread_name), "TcpVideo%d", stream_id);
 	prctl(PR_SET_NAME, thread_name, 0, 0, 0);
 	LOG_INFO("TCP video accept thread started for stream %d on port %d\n", stream_id,
-	         stream_id == 0 ? TCP_VIDEO_PORT_0 : TCP_VIDEO_PORT_1);
+	         stream_id == 0 ? TCP_VIDEO_PORT_0 : (stream_id == 1 ? TCP_VIDEO_PORT_1 : TCP_VIDEO_PORT_2));
 
 	while (g_video_run_) {
 		struct sockaddr_in client_addr;
@@ -420,8 +441,9 @@ static int tcp_video_send_frame(int stream_id, void *data, unsigned int len) {
 }
 
 static int tcp_video_server_init() {
-	for (int i = 0; i < 2; i++) {
-		int port = (i == 0) ? TCP_VIDEO_PORT_0 : TCP_VIDEO_PORT_1;
+	static const int ports[] = {TCP_VIDEO_PORT_0, TCP_VIDEO_PORT_1, TCP_VIDEO_PORT_2};
+	for (int i = 0; i < TCP_VIDEO_STREAM_COUNT; i++) {
+		int port = ports[i];
 		int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 		if (server_fd < 0) {
 			LOG_ERROR("TCP video socket create failed for stream %d: %s\n", i, strerror(errno));
@@ -455,11 +477,12 @@ static int tcp_video_server_init() {
 
 	pthread_create(&tcp_video_thread_0, NULL, tcp_video_accept_thread, (void *)(intptr_t)0);
 	pthread_create(&tcp_video_thread_1, NULL, tcp_video_accept_thread, (void *)(intptr_t)1);
+	pthread_create(&tcp_video_thread_2, NULL, tcp_video_accept_thread, (void *)(intptr_t)2);
 	return 0;
 }
 
 static void tcp_video_server_deinit() {
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < TCP_VIDEO_STREAM_COUNT; i++) {
 		if (tcp_video_server_fd[i] >= 0) {
 			close(tcp_video_server_fd[i]);
 			tcp_video_server_fd[i] = -1;
@@ -472,6 +495,203 @@ static void tcp_video_server_deinit() {
 		pthread_join(tcp_video_thread_0, NULL);
 	if (tcp_video_thread_1)
 		pthread_join(tcp_video_thread_1, NULL);
+	if (tcp_video_thread_2)
+		pthread_join(tcp_video_thread_2, NULL);
+}
+
+// ========== TCP Control Server (Port 5102) ==========
+static const char *valid_exposure_values[] = {
+	"1/50", "1/100", "1/150", "1/200", "1/250",
+	"1/500", "1/750", "1/1000", "1/2000", "1/4000"
+};
+#define NUM_VALID_EXPOSURES (sizeof(valid_exposure_values) / sizeof(valid_exposure_values[0]))
+
+static int is_valid_exposure(const char *value) {
+	for (int i = 0; i < (int)NUM_VALID_EXPOSURES; i++) {
+		if (strcmp(valid_exposure_values[i], value) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+static void tcp_control_handle_command(int client_fd, char *cmd) {
+	// Strip trailing \r\n
+	char *p = cmd + strlen(cmd) - 1;
+	while (p >= cmd && (*p == '\n' || *p == '\r' || *p == ' '))
+		*p-- = '\0';
+
+	if (strlen(cmd) == 0)
+		return;
+
+	LOG_INFO("TCP control: command=[%s] (len=%d)\n", cmd, (int)strlen(cmd));
+
+	if (strncmp(cmd, "manualExposure:", 15) == 0) {
+		const char *exposure_val = cmd + 15;
+		if (!is_valid_exposure(exposure_val)) {
+			LOG_WARN("TCP control: invalid exposure value '%s'\n", exposure_val);
+			const char *resp = "ERR:invalid exposure value\n";
+			send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
+			return;
+		}
+		rk_isp_set_exposure_mode(0, "manual");
+		rk_isp_set_exposure_time(0, exposure_val);
+		rk_isp_set_exposure_gain(0, 1);
+		LOG_INFO("TCP control: manual exposure set to %s, gain=1\n", exposure_val);
+		char resp[64];
+		snprintf(resp, sizeof(resp), "OK:manualExposure:%s\n", exposure_val);
+		send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
+	} else if (strcmp(cmd, "autoExposure") == 0) {
+		rk_isp_set_exposure_mode(0, "auto");
+		LOG_INFO("TCP control: auto exposure restored\n");
+		const char *resp = "OK:autoExposure\n";
+		send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
+	} else {
+		LOG_WARN("TCP control: unknown command '%s'\n", cmd);
+		const char *resp = "ERR:unknown command\n";
+		send(client_fd, resp, strlen(resp), MSG_NOSIGNAL);
+	}
+}
+
+static void *tcp_control_handler_thread(void *arg) {
+	int client_fd = (int)(intptr_t)arg;
+	prctl(PR_SET_NAME, "TcpCtrlHandler", 0, 0, 0);
+	LOG_INFO("TCP control: client connected\n");
+
+	// Set receive timeout so we can check g_video_run_ periodically
+	struct timeval tv;
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	char buf[256];
+	int buf_len = 0;
+
+	while (g_video_run_) {
+		int n = recv(client_fd, buf + buf_len, sizeof(buf) - buf_len - 1, 0);
+		if (n > 0) {
+			buf_len += n;
+			buf[buf_len] = '\0';
+			LOG_INFO("TCP control: recv %d bytes, buf=[%s] (len=%d)\n", n, buf, buf_len);
+			// Process complete lines
+			char *newline;
+			while ((newline = strchr(buf, '\n')) != NULL) {
+				*newline = '\0';
+				tcp_control_handle_command(client_fd, buf);
+				int consumed = (newline - buf) + 1;
+				memmove(buf, newline + 1, buf_len - consumed);
+				buf_len -= consumed;
+			}
+			if (buf_len >= (int)sizeof(buf) - 1) {
+				// Buffer overflow, discard
+				buf_len = 0;
+			}
+		} else if (n == 0) {
+			// Client disconnected
+			LOG_INFO("TCP control: client disconnected, restoring auto exposure\n");
+			break;
+		} else {
+			// recv error: EAGAIN/EWOULDBLOCK means timeout (normal), others mean disconnect
+			if (errno != EAGAIN && errno != EWOULDBLOCK)
+				break;
+		}
+	}
+
+	// Restore auto exposure on disconnect
+	rk_isp_set_exposure_mode(0, "auto");
+	LOG_INFO("TCP control: auto exposure restored on disconnect\n");
+
+	close(client_fd);
+	int expected = client_fd;
+	__atomic_compare_exchange_n(&tcp_control_client_fd, &expected, -1,
+	                            0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
+	return NULL;
+}
+
+static void *tcp_control_accept_thread(void *arg) {
+	prctl(PR_SET_NAME, "TcpCtrlAccept", 0, 0, 0);
+	LOG_INFO("TCP control accept thread started on port %d\n", TCP_CONTROL_PORT);
+
+	while (g_video_run_) {
+		struct sockaddr_in client_addr;
+		socklen_t addr_len = sizeof(client_addr);
+		int client_fd = accept(tcp_control_server_fd,
+		                       (struct sockaddr *)&client_addr, &addr_len);
+		if (client_fd < 0) {
+			if (g_video_run_ && errno != EINTR)
+				LOG_ERROR("TCP control accept error: %s\n", strerror(errno));
+			continue;
+		}
+
+		int flag = 1;
+		setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+		// Disconnect old client, keep only new one
+		int old_fd = __atomic_exchange_n(&tcp_control_client_fd, client_fd, __ATOMIC_SEQ_CST);
+		if (old_fd >= 0) {
+			LOG_INFO("TCP control: disconnecting old client\n");
+			shutdown(old_fd, SHUT_RDWR);
+			close(old_fd);
+			// Restore auto exposure when old client is kicked
+			rk_isp_set_exposure_mode(0, "auto");
+		}
+
+		LOG_INFO("TCP control: new client from %s:%d\n",
+		         inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+
+		pthread_t handler;
+		pthread_create(&handler, NULL, tcp_control_handler_thread, (void *)(intptr_t)client_fd);
+		pthread_detach(handler);
+	}
+	return NULL;
+}
+
+static int tcp_control_server_init(void) {
+	int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (server_fd < 0) {
+		LOG_ERROR("TCP control socket create failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	int reuse = 1;
+	setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = INADDR_ANY;
+	addr.sin_port = htons(TCP_CONTROL_PORT);
+
+	if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		LOG_ERROR("TCP control bind port %d failed: %s\n", TCP_CONTROL_PORT, strerror(errno));
+		close(server_fd);
+		return -1;
+	}
+
+	if (listen(server_fd, 1) < 0) {
+		LOG_ERROR("TCP control listen port %d failed: %s\n", TCP_CONTROL_PORT, strerror(errno));
+		close(server_fd);
+		return -1;
+	}
+
+	tcp_control_server_fd = server_fd;
+	LOG_INFO("TCP control server listening on port %d\n", TCP_CONTROL_PORT);
+
+	pthread_create(&tcp_control_thread, NULL, tcp_control_accept_thread, NULL);
+	return 0;
+}
+
+static void tcp_control_server_deinit(void) {
+	if (tcp_control_server_fd >= 0) {
+		close(tcp_control_server_fd);
+		tcp_control_server_fd = -1;
+	}
+	int fd = __atomic_exchange_n(&tcp_control_client_fd, -1, __ATOMIC_SEQ_CST);
+	if (fd >= 0) {
+		shutdown(fd, SHUT_RDWR);
+		close(fd);
+	}
+	if (tcp_control_thread)
+		pthread_join(tcp_control_thread, NULL);
 }
 
 static void *rkipc_get_jpeg(void *arg) {
@@ -1076,37 +1296,28 @@ int rkipc_pipe_0_init() {
 	memset(&stRecvParam, 0, sizeof(VENC_RECV_PIC_PARAM_S));
 	stRecvParam.s32RecvPicNum = -1;
 	RK_MPI_VENC_StartRecvFrame(VIDEO_PIPE_0, &stRecvParam);
-	pthread_create(&venc_thread_0, NULL, rkipc_get_venc_0, NULL);
-	// bind
-	vi_chn.enModId = RK_ID_VI;
-	vi_chn.s32DevId = 0;
-	vi_chn.s32ChnId = VIDEO_PIPE_0;
-	venc_chn.enModId = RK_ID_VENC;
-	venc_chn.s32DevId = 0;
-	venc_chn.s32ChnId = VIDEO_PIPE_0;
-	ret = RK_MPI_SYS_Bind(&vi_chn, &venc_chn);
-	if (ret)
-		LOG_ERROR("Bind VI and VENC error! ret=%#x\n", ret);
-	else
-		LOG_DEBUG("Bind VI and VENC success\n");
+	pthread_create(&venc_thread_0, NULL, rkipc_get_venc_lazy, (void *)(intptr_t)0);
+	// NOTE: VI->VENC bind moved to rkipc_get_venc_lazy (lazy binding)
 
 	return 0;
 }
 
 int rkipc_pipe_0_deinit() {
 	int ret;
-	// unbind
-	vi_chn.enModId = RK_ID_VI;
-	vi_chn.s32DevId = 0;
-	vi_chn.s32ChnId = VIDEO_PIPE_0;
-	venc_chn.enModId = RK_ID_VENC;
-	venc_chn.s32DevId = 0;
-	venc_chn.s32ChnId = VIDEO_PIPE_0;
-	ret = RK_MPI_SYS_UnBind(&vi_chn, &venc_chn);
-	if (ret)
-		LOG_ERROR("Unbind VI and VENC error! ret=%#x\n", ret);
-	else
-		LOG_DEBUG("Unbind VI and VENC success\n");
+	// unbind only if still bound (lazy binding)
+	if (pipe_0_bound) {
+		MPP_CHN_S lvi, lvenc;
+		lvi.enModId = RK_ID_VI;
+		lvi.s32DevId = 0;
+		lvi.s32ChnId = VIDEO_PIPE_0;
+		lvenc.enModId = RK_ID_VENC;
+		lvenc.s32DevId = 0;
+		lvenc.s32ChnId = VIDEO_PIPE_0;
+		ret = RK_MPI_SYS_UnBind(&lvi, &lvenc);
+		if (ret)
+			LOG_ERROR("Unbind VI and VENC error! ret=%#x\n", ret);
+		pipe_0_bound = 0;
+	}
 	// VENC
 	ret = RK_MPI_VENC_StopRecvFrame(VIDEO_PIPE_0);
 	ret |= RK_MPI_VENC_DestroyChn(VIDEO_PIPE_0);
@@ -1418,21 +1629,9 @@ int rkipc_pipe_1_init() {
 	memset(&stRecvParam, 0, sizeof(VENC_RECV_PIC_PARAM_S));
 	stRecvParam.s32RecvPicNum = -1;
 	RK_MPI_VENC_StartRecvFrame(VIDEO_PIPE_1, &stRecvParam);
-	pthread_create(&venc_thread_1, NULL, rkipc_get_venc_1, NULL);
+	pthread_create(&venc_thread_1, NULL, rkipc_get_venc_lazy, (void *)(intptr_t)1);
 
-	// pthread_create(&vi_thread_1, NULL, rkipc_get_vi_draw_send_venc, NULL);
-	// bind
-	vi_chn.enModId = RK_ID_VI;
-	vi_chn.s32DevId = 0;
-	vi_chn.s32ChnId = VIDEO_PIPE_1;
-	venc_chn.enModId = RK_ID_VENC;
-	venc_chn.s32DevId = 0;
-	venc_chn.s32ChnId = VIDEO_PIPE_1;
-	ret = RK_MPI_SYS_Bind(&vi_chn, &venc_chn);
-	if (ret)
-		LOG_ERROR("Bind VI and VENC error! ret=%#x\n", ret);
-	else
-		LOG_DEBUG("Bind VI and VENC success\n");
+	// NOTE: VI->VENC bind moved to rkipc_get_venc_lazy (lazy binding)
 
 	if (!g_enable_vo)
 		return 0;
@@ -1570,18 +1769,20 @@ int rkipc_pipe_1_init() {
 
 int rkipc_pipe_1_deinit() {
 	int ret;
-	// unbind
-	vi_chn.enModId = RK_ID_VI;
-	vi_chn.s32DevId = 0;
-	vi_chn.s32ChnId = VIDEO_PIPE_1;
-	venc_chn.enModId = RK_ID_VENC;
-	venc_chn.s32DevId = 0;
-	venc_chn.s32ChnId = VIDEO_PIPE_1;
-	ret = RK_MPI_SYS_UnBind(&vi_chn, &venc_chn);
-	if (ret)
-		LOG_ERROR("Unbind VI and VENC error! ret=%#x\n", ret);
-	else
-		LOG_DEBUG("Unbind VI and VENC success\n");
+	// unbind only if still bound (lazy binding)
+	if (pipe_1_bound) {
+		MPP_CHN_S lvi, lvenc;
+		lvi.enModId = RK_ID_VI;
+		lvi.s32DevId = 0;
+		lvi.s32ChnId = VIDEO_PIPE_1;
+		lvenc.enModId = RK_ID_VENC;
+		lvenc.s32DevId = 0;
+		lvenc.s32ChnId = VIDEO_PIPE_1;
+		ret = RK_MPI_SYS_UnBind(&lvi, &lvenc);
+		if (ret)
+			LOG_ERROR("Unbind VI and VENC error! ret=%#x\n", ret);
+		pipe_1_bound = 0;
+	}
 	// VENC
 	ret = RK_MPI_VENC_StopRecvFrame(VIDEO_PIPE_1);
 	ret |= RK_MPI_VENC_DestroyChn(VIDEO_PIPE_1);
@@ -3307,6 +3508,525 @@ int rk_roi_set(roi_data_s *roi_data) {
 // 	return ret;
 // }
 
+// ========== USB Camera Module (V4L2 + VDEC + VENC) ==========
+
+// Find USB camera device that supports MJPG at desired resolution
+static int usb_camera_find_device(int *fd_out, int *out_width, int *out_height, int *out_fps) {
+	char dev_path[32];
+
+	// Resolution fallback chain: requested -> 1280x720 -> 640x480 -> 320x240
+	struct { int w, h; } res_table[] = {
+		{ *out_width, *out_height },
+		{ 1280, 720 },
+		{ 640, 480 },
+		{ 320, 240 },
+	};
+	int res_count = sizeof(res_table) / sizeof(res_table[0]);
+
+	for (int i = 0; i < 10; i++) {
+		snprintf(dev_path, sizeof(dev_path), "/dev/video%d", i);
+		int fd = open(dev_path, O_RDWR);
+		if (fd < 0)
+			continue;
+
+		struct v4l2_capability cap;
+		if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0 ||
+		    !(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
+		    !(cap.capabilities & V4L2_CAP_STREAMING)) {
+			close(fd);
+			continue;
+		}
+
+		// Check for MJPEG support
+		int has_mjpeg = 0;
+		struct v4l2_fmtdesc fmtdesc;
+		memset(&fmtdesc, 0, sizeof(fmtdesc));
+		fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		while (ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
+			if (fmtdesc.pixelformat == V4L2_PIX_FMT_MJPEG) {
+				has_mjpeg = 1;
+				break;
+			}
+			fmtdesc.index++;
+		}
+		if (!has_mjpeg) {
+			close(fd);
+			continue;
+		}
+
+		// Try each resolution in fallback chain
+		int found_res = -1;
+		for (int r = 0; r < res_count; r++) {
+			int try_w = res_table[r].w;
+			int try_h = res_table[r].h;
+
+			struct v4l2_frmsizeenum frmsize;
+			memset(&frmsize, 0, sizeof(frmsize));
+			frmsize.pixel_format = V4L2_PIX_FMT_MJPEG;
+			int has_res = 0;
+			while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0) {
+				if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE &&
+				    frmsize.discrete.width == (unsigned)try_w &&
+				    frmsize.discrete.height == (unsigned)try_h) {
+					has_res = 1;
+					break;
+				}
+				frmsize.index++;
+			}
+			if (!has_res)
+				continue;
+
+			// Check desired fps, fallback to 15fps
+			int actual_fps = 0;
+			int try_fps[] = { *out_fps, 15 };
+			for (int f = 0; f < 2; f++) {
+				struct v4l2_frmivalenum frmival;
+				memset(&frmival, 0, sizeof(frmival));
+				frmival.pixel_format = V4L2_PIX_FMT_MJPEG;
+				frmival.width = try_w;
+				frmival.height = try_h;
+				while (ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) == 0) {
+					if (frmival.type == V4L2_FRMIVAL_TYPE_DISCRETE &&
+					    frmival.discrete.numerator == 1 &&
+					    frmival.discrete.denominator == (unsigned)try_fps[f]) {
+						actual_fps = try_fps[f];
+						break;
+					}
+					frmival.index++;
+				}
+				if (actual_fps)
+					break;
+			}
+			if (!actual_fps)
+				continue;
+
+			// Found a working resolution + fps combo
+			found_res = r;
+			*out_width = try_w;
+			*out_height = try_h;
+			*out_fps = actual_fps;
+			break;
+		}
+
+		if (found_res < 0) {
+			LOG_WARN("USB camera %s: no supported MJPG resolution found\n", dev_path);
+			close(fd);
+			continue;
+		}
+
+		if (found_res > 0)
+			LOG_WARN("USB camera: requested resolution not supported, using fallback %dx%d @%dfps\n",
+			         *out_width, *out_height, *out_fps);
+
+		*fd_out = fd;
+		LOG_INFO("Found USB camera: %s (MJPG %dx%d @%dfps)\n",
+		         dev_path, *out_width, *out_height, *out_fps);
+		return 0;
+	}
+	return -1;
+}
+
+static int usb_camera_init(void) {
+	int w = rk_param_get_int("video.usb:width", USB_CAMERA_DEFAULT_WIDTH);
+	int h = rk_param_get_int("video.usb:height", USB_CAMERA_DEFAULT_HEIGHT);
+	int fps = rk_param_get_int("video.usb:fps", USB_CAMERA_DEFAULT_FPS);
+	usb_cam_width_ = w;
+	usb_cam_height_ = h;
+	usb_cam_fps_ = fps;
+
+	// Check if user specified a device path
+	const char *dev_cfg = rk_param_get_string("video.usb:device", NULL);
+	if (dev_cfg && strlen(dev_cfg) > 0) {
+		usb_camera_fd_ = open(dev_cfg, O_RDWR);
+		if (usb_camera_fd_ < 0) {
+			LOG_WARN("USB camera: cannot open %s: %s\n", dev_cfg, strerror(errno));
+			return -1;
+		}
+	} else {
+		if (usb_camera_find_device(&usb_camera_fd_, &usb_cam_width_, &usb_cam_height_, &usb_cam_fps_) < 0) {
+			LOG_WARN("USB camera: no suitable MJPG camera found\n");
+			return -1;
+		}
+	}
+
+	// Set format
+	struct v4l2_format fmt;
+	memset(&fmt, 0, sizeof(fmt));
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	fmt.fmt.pix.width = usb_cam_width_;
+	fmt.fmt.pix.height = usb_cam_height_;
+	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+	fmt.fmt.pix.field = V4L2_FIELD_NONE;
+	if (ioctl(usb_camera_fd_, VIDIOC_S_FMT, &fmt) < 0) {
+		LOG_ERROR("USB camera: VIDIOC_S_FMT failed: %s\n", strerror(errno));
+		close(usb_camera_fd_);
+		usb_camera_fd_ = -1;
+		return -1;
+	}
+
+	// Set frame rate
+	struct v4l2_streamparm parm;
+	memset(&parm, 0, sizeof(parm));
+	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	parm.parm.capture.timeperframe.numerator = 1;
+	parm.parm.capture.timeperframe.denominator = usb_cam_fps_;
+	ioctl(usb_camera_fd_, VIDIOC_S_PARM, &parm);
+
+	// Request mmap buffers
+	struct v4l2_requestbuffers req;
+	memset(&req, 0, sizeof(req));
+	req.count = USB_CAMERA_BUF_COUNT;
+	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	req.memory = V4L2_MEMORY_MMAP;
+	if (ioctl(usb_camera_fd_, VIDIOC_REQBUFS, &req) < 0) {
+		LOG_ERROR("USB camera: VIDIOC_REQBUFS failed: %s\n", strerror(errno));
+		close(usb_camera_fd_);
+		usb_camera_fd_ = -1;
+		return -1;
+	}
+
+	// Map buffers
+	for (unsigned i = 0; i < req.count; i++) {
+		struct v4l2_buffer buf;
+		memset(&buf, 0, sizeof(buf));
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index = i;
+		if (ioctl(usb_camera_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
+			LOG_ERROR("USB camera: VIDIOC_QUERYBUF %d failed\n", i);
+			close(usb_camera_fd_);
+			usb_camera_fd_ = -1;
+			return -1;
+		}
+		usb_v4l2_buffers_[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
+		                              MAP_SHARED, usb_camera_fd_, buf.m.offset);
+		usb_v4l2_buffer_lengths_[i] = buf.length;
+		// Queue buffer
+		if (ioctl(usb_camera_fd_, VIDIOC_QBUF, &buf) < 0) {
+			LOG_ERROR("USB camera: VIDIOC_QBUF %d failed\n", i);
+		}
+	}
+
+	usb_camera_available_ = 1;
+	LOG_INFO("USB camera initialized: MJPG %dx%d @%dfps\n",
+	         usb_cam_width_, usb_cam_height_, usb_cam_fps_);
+	return 0;
+}
+
+static void usb_camera_start_stream(void) {
+	if (usb_camera_fd_ < 0 || usb_camera_streaming_)
+		return;
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if (ioctl(usb_camera_fd_, VIDIOC_STREAMON, &type) < 0) {
+		LOG_ERROR("USB camera: VIDIOC_STREAMON failed: %s\n", strerror(errno));
+		return;
+	}
+	usb_camera_streaming_ = 1;
+	LOG_INFO("USB camera: stream started\n");
+}
+
+static void usb_camera_stop_stream(void) {
+	if (usb_camera_fd_ < 0 || !usb_camera_streaming_)
+		return;
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	ioctl(usb_camera_fd_, VIDIOC_STREAMOFF, &type);
+	usb_camera_streaming_ = 0;
+	LOG_INFO("USB camera: stream stopped\n");
+}
+
+static void usb_camera_deinit(void) {
+	usb_camera_stop_stream();
+	if (usb_camera_fd_ >= 0) {
+		for (int i = 0; i < USB_CAMERA_BUF_COUNT; i++) {
+			if (usb_v4l2_buffers_[i] && usb_v4l2_buffers_[i] != MAP_FAILED) {
+				munmap(usb_v4l2_buffers_[i], usb_v4l2_buffer_lengths_[i]);
+				usb_v4l2_buffers_[i] = NULL;
+			}
+		}
+		close(usb_camera_fd_);
+		usb_camera_fd_ = -1;
+	}
+	usb_camera_available_ = 0;
+}
+
+// VDEC JPEG decoder for USB camera MJPG frames
+static int vdec_jpeg_init(void) {
+	VDEC_CHN_ATTR_S attr;
+	memset(&attr, 0, sizeof(attr));
+	attr.enType = RK_VIDEO_ID_JPEG;
+	attr.enMode = VIDEO_MODE_FRAME;
+	attr.u32PicWidth = usb_cam_width_;
+	attr.u32PicHeight = usb_cam_height_;
+	attr.u32PicVirWidth = usb_cam_width_;
+	attr.u32PicVirHeight = usb_cam_height_;
+	attr.u32StreamBufSize = usb_cam_width_ * usb_cam_height_ * 3 / 2;
+	attr.u32FrameBufSize = usb_cam_width_ * usb_cam_height_ * 3 / 2;
+	attr.u32FrameBufCnt = 2;
+	attr.u32StreamBufCnt = 8;
+
+	int ret = RK_MPI_VDEC_CreateChn(VDEC_CHN_ID, &attr);
+	if (ret) {
+		LOG_ERROR("VDEC: CreateChn failed ret=%#x (VDEC may not be supported on this firmware)\n", ret);
+		return ret;
+	}
+
+	// Set output pixel format to NV12
+	VDEC_CHN_PARAM_S param;
+	memset(&param, 0, sizeof(param));
+	param.enType = RK_VIDEO_ID_JPEG;
+	param.stVdecPictureParam.enPixelFormat = RK_FMT_YUV420SP;
+	ret = RK_MPI_VDEC_SetChnParam(VDEC_CHN_ID, &param);
+	if (ret)
+		LOG_WARN("VDEC: SetChnParam ret=%#x\n", ret);
+
+	ret = RK_MPI_VDEC_StartRecvStream(VDEC_CHN_ID);
+	if (ret) {
+		LOG_ERROR("VDEC: StartRecvStream failed ret=%#x\n", ret);
+		RK_MPI_VDEC_DestroyChn(VDEC_CHN_ID);
+		return ret;
+	}
+
+	LOG_INFO("VDEC JPEG decoder initialized (%dx%d)\n", usb_cam_width_, usb_cam_height_);
+	return 0;
+}
+
+static void vdec_jpeg_deinit(void) {
+	RK_MPI_VDEC_StopRecvStream(VDEC_CHN_ID);
+	RK_MPI_VDEC_DestroyChn(VDEC_CHN_ID);
+}
+
+// Decode one MJPG frame to NV12 YUV via VDEC
+static int vdec_decode_jpeg(void *jpeg_data, int jpeg_len, VIDEO_FRAME_INFO_S *out_frame) {
+	VDEC_STREAM_S stream;
+	memset(&stream, 0, sizeof(stream));
+	stream.u32Len = jpeg_len;
+	stream.bEndOfStream = RK_FALSE;
+	stream.bEndOfFrame = RK_TRUE;
+
+	// Allocate MB_BLK for JPEG data
+	MB_BLK mbBlk = NULL;
+	int ret = RK_MPI_SYS_MmzAlloc(&mbBlk, NULL, "vdec_jpeg", jpeg_len);
+	if (ret) {
+		LOG_ERROR("VDEC: MmzAlloc failed\n");
+		return -1;
+	}
+	void *vir = RK_MPI_MB_Handle2VirAddr(mbBlk);
+	memcpy(vir, jpeg_data, jpeg_len);
+	RK_MPI_SYS_MmzFlushCache(mbBlk, RK_TRUE);
+	stream.pMbBlk = mbBlk;
+
+	ret = RK_MPI_VDEC_SendStream(VDEC_CHN_ID, &stream, 1000);
+	RK_MPI_SYS_MmzFree(mbBlk);
+	if (ret) {
+		LOG_ERROR("VDEC: SendStream failed ret=%#x\n", ret);
+		return -1;
+	}
+
+	ret = RK_MPI_VDEC_GetFrame(VDEC_CHN_ID, out_frame, 1000);
+	if (ret) {
+		LOG_ERROR("VDEC: GetFrame failed ret=%#x\n", ret);
+		return -1;
+	}
+	return 0;
+}
+
+// Create VENC channel for USB camera H265 encoding
+static int usb_venc_create(void) {
+	VENC_CHN_ATTR_S attr;
+	memset(&attr, 0, sizeof(attr));
+	attr.stVencAttr.enType = RK_VIDEO_ID_HEVC;
+	attr.stVencAttr.enPixelFormat = RK_FMT_YUV420SP;
+	attr.stVencAttr.u32MaxPicWidth = usb_cam_width_;
+	attr.stVencAttr.u32MaxPicHeight = usb_cam_height_;
+	attr.stVencAttr.u32PicWidth = usb_cam_width_;
+	attr.stVencAttr.u32PicHeight = usb_cam_height_;
+	attr.stVencAttr.u32VirWidth = usb_cam_width_;
+	attr.stVencAttr.u32VirHeight = usb_cam_height_;
+	attr.stVencAttr.u32StreamBufCnt = 3;
+	attr.stVencAttr.u32BufSize = usb_cam_width_ * usb_cam_height_ * 3 / 2;
+	attr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
+	attr.stRcAttr.stH265Cbr.u32Gop = rk_param_get_int("video.usb:gop", 30);
+	attr.stRcAttr.stH265Cbr.u32BitRate = rk_param_get_int("video.usb:max_rate", 1024);
+
+	int ret = RK_MPI_VENC_CreateChn(USB_VENC_CHN, &attr);
+	if (ret) {
+		LOG_ERROR("USB VENC: CreateChn failed ret=%#x\n", ret);
+		return ret;
+	}
+
+	VENC_RECV_PIC_PARAM_S stRecvParam;
+	memset(&stRecvParam, 0, sizeof(stRecvParam));
+	stRecvParam.s32RecvPicNum = -1;
+	RK_MPI_VENC_StartRecvFrame(USB_VENC_CHN, &stRecvParam);
+
+	LOG_INFO("USB VENC channel %d created (H265 %dx%d)\n",
+	         USB_VENC_CHN, usb_cam_width_, usb_cam_height_);
+	return 0;
+}
+
+static void usb_venc_destroy(void) {
+	RK_MPI_VENC_StopRecvFrame(USB_VENC_CHN);
+	RK_MPI_VENC_DestroyChn(USB_VENC_CHN);
+}
+
+// USB camera encode thread with auto-reconnect:
+//   Outer loop: detect device -> init -> encode -> on failure: cleanup -> re-detect
+static void *usb_camera_encode_thread(void *arg) {
+	(void)arg;
+	prctl(PR_SET_NAME, "UsbCamEnc", 0, 0, 0);
+	LOG_INFO("USB camera thread started (auto-reconnect enabled)\n");
+
+	VENC_STREAM_S stFrame;
+	stFrame.pstPack = malloc(sizeof(VENC_PACK_S));
+	int ret;
+	int vdec_created = 0;
+	int venc_created = 0;
+	int consecutive_errors = 0;
+
+	while (g_video_run_) {
+		// === Phase 1: Device discovery + V4L2 init (usb_camera_init handles both) ===
+		if (usb_camera_init() != 0) {
+			if (g_video_run_)
+				LOG_INFO("USB camera: no device found, retrying in 3s...\n");
+			for (int i = 0; i < 30 && g_video_run_; i++)
+				usleep(100000);
+			continue;
+		}
+
+		LOG_INFO("USB camera: device ready (%dx%d @%dfps), waiting for TCP client...\n",
+		         usb_cam_width_, usb_cam_height_, usb_cam_fps_);
+		consecutive_errors = 0;
+		vdec_created = 0;
+		venc_created = 0;
+
+		// === Phase 2: Encode loop (runs until disconnect or exit) ===
+		while (g_video_run_) {
+			int client_connected = (__atomic_load_n(&tcp_video_client_fd[2], __ATOMIC_ACQUIRE) >= 0);
+
+			if (!client_connected) {
+				// No TCP client: stop streaming to save USB bandwidth for 4G module
+				if (usb_camera_streaming_)
+					usb_camera_stop_stream();
+				if (venc_created) {
+					usb_venc_destroy();
+					venc_created = 0;
+				}
+				if (vdec_created) {
+					vdec_jpeg_deinit();
+					vdec_created = 0;
+				}
+				usleep(50000);
+				continue;
+			}
+
+			// TCP client connected: start pipeline if not already running
+			if (!vdec_created) {
+				if (vdec_jpeg_init() != 0) {
+					LOG_ERROR("USB camera: VDEC init failed, retrying...\n");
+					usleep(500000);
+					continue;
+				}
+				vdec_created = 1;
+			}
+			if (!venc_created) {
+				if (usb_venc_create() != 0) {
+					LOG_ERROR("USB camera: VENC init failed, retrying...\n");
+					usleep(500000);
+					continue;
+				}
+				venc_created = 1;
+			}
+			if (!usb_camera_streaming_)
+				usb_camera_start_stream();
+
+			// 1. Dequeue V4L2 buffer (get MJPG frame)
+			struct v4l2_buffer vbuf;
+			memset(&vbuf, 0, sizeof(vbuf));
+			vbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			vbuf.memory = V4L2_MEMORY_MMAP;
+			ret = ioctl(usb_camera_fd_, VIDIOC_DQBUF, &vbuf);
+			if (ret < 0) {
+				if (errno == EAGAIN) {
+					usleep(1000);
+					continue;
+				}
+				LOG_ERROR("USB camera: DQBUF failed: %s (device disconnected?)\n", strerror(errno));
+				consecutive_errors++;
+				break;  // -> cleanup and reconnect
+			}
+
+			void *jpeg_data = usb_v4l2_buffers_[vbuf.index];
+			int jpeg_len = vbuf.bytesused;
+
+			// 2. Decode MJPG -> NV12 via VDEC
+			VIDEO_FRAME_INFO_S dec_frame;
+			if (vdec_decode_jpeg(jpeg_data, jpeg_len, &dec_frame) == 0) {
+				// 3. Send decoded YUV frame to VENC
+				VIDEO_FRAME_INFO_S vi_frame;
+				memset(&vi_frame, 0, sizeof(vi_frame));
+				vi_frame.stVFrame.pMbBlk = dec_frame.stVFrame.pMbBlk;
+				vi_frame.stVFrame.u32Width = dec_frame.stVFrame.u32Width;
+				vi_frame.stVFrame.u32Height = dec_frame.stVFrame.u32Height;
+				vi_frame.stVFrame.u32VirWidth = dec_frame.stVFrame.u32VirWidth;
+				vi_frame.stVFrame.u32VirHeight = dec_frame.stVFrame.u32VirHeight;
+				vi_frame.stVFrame.enPixelFormat = dec_frame.stVFrame.enPixelFormat;
+				vi_frame.stVFrame.u64PTS = dec_frame.stVFrame.u64PTS;
+
+				ret = RK_MPI_VENC_SendFrame(USB_VENC_CHN, &vi_frame, 1000);
+				RK_MPI_VDEC_ReleaseFrame(VDEC_CHN_ID, &dec_frame);
+
+				if (ret == RK_SUCCESS) {
+					// 4. Get H265 encoded frame
+					ret = RK_MPI_VENC_GetStream(USB_VENC_CHN, &stFrame, 1000);
+					if (ret == RK_SUCCESS) {
+						void *data = RK_MPI_MB_Handle2VirAddr(stFrame.pstPack->pMbBlk);
+						// 5. Send to TCP port 5105
+						tcp_video_send_frame(2, data, stFrame.pstPack->u32Len);
+						RK_MPI_VENC_ReleaseStream(USB_VENC_CHN, &stFrame);
+					}
+				}
+			}
+
+			// 6. Requeue V4L2 buffer
+			if (ioctl(usb_camera_fd_, VIDIOC_QBUF, &vbuf) < 0) {
+				LOG_ERROR("USB camera: QBUF failed: %s (device disconnected?)\n", strerror(errno));
+				consecutive_errors++;
+				break;  // -> cleanup and reconnect
+			}
+
+			consecutive_errors = 0;  // Reset on success
+		}
+
+		// === Phase 3: Cleanup after disconnect ===
+		LOG_INFO("USB camera: cleaning up after disconnect (errors=%d)...\n", consecutive_errors);
+		if (venc_created) {
+			usb_venc_destroy();
+			venc_created = 0;
+		}
+		if (vdec_created) {
+			vdec_jpeg_deinit();
+			vdec_created = 0;
+		}
+		usb_camera_deinit();
+
+		// Wait before re-detecting device
+		if (g_video_run_) {
+			LOG_INFO("USB camera: will re-detect device in 3s...\n");
+			for (int i = 0; i < 30 && g_video_run_; i++)
+				usleep(100000);
+		}
+	}
+
+	// Final cleanup
+	if (stFrame.pstPack)
+		free(stFrame.pstPack);
+
+	LOG_INFO("USB camera thread exited\n");
+	return NULL;
+}
+
+// ========== End USB Camera Module ==========
+
 int rk_video_init() {
 	LOG_DEBUG("begin\n");
 	int ret = 0;
@@ -3338,6 +4058,7 @@ int rk_video_init() {
 		ret |= rkipc_rtmp_init();
 	if (enable_tcp_video)
 		ret |= tcp_video_server_init();
+	ret |= tcp_control_server_init();
 	if (enable_venc_0)
 		ret |= rkipc_pipe_0_init();
 	if (enable_venc_1)
@@ -3357,6 +4078,13 @@ int rk_video_init() {
 	// otherwise, when the font size is switched, holes may be caused
 	if (enable_osd)
 		ret |= rkipc_osd_init();
+
+	// USB Camera (optional, auto-reconnect thread handles device discovery)
+	if (rk_param_get_int("video.usb:enable", 1)) {
+		pthread_create(&usb_camera_thread_, NULL, usb_camera_encode_thread, NULL);
+		LOG_INFO("USB camera auto-reconnect thread created\n");
+	}
+
 	LOG_DEBUG("over\n");
 
 	return ret;
@@ -3366,6 +4094,13 @@ int rk_video_deinit() {
 	LOG_DEBUG("%s\n", __func__);
 	g_video_run_ = 0;
 	int ret = 0;
+
+	// USB Camera cleanup (join auto-reconnect thread + safe deinit)
+	if (usb_camera_thread_) {
+		pthread_join(usb_camera_thread_, NULL);
+		usb_camera_thread_ = 0;
+	}
+	usb_camera_deinit();  // safe: checks fd >= 0 internally
 	if (enable_npu || enable_ivs)
 		ret |= rkipc_pipe_2_deinit();
 	// rk_region_clip_set_callback_register(NULL);
@@ -3393,6 +4128,7 @@ int rk_video_deinit() {
 	ret |= rkipc_vi_dev_deinit();
 	if (enable_tcp_video)
 		tcp_video_server_deinit();
+	tcp_control_server_deinit();
 	if (enable_rtmp)
 		ret |= rkipc_rtmp_deinit();
 	if (enable_rtsp)

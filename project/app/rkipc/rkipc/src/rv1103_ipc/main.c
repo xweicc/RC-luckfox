@@ -158,6 +158,9 @@ int main(int argc, char **argv) {
 	rk_param_init(rkipc_ini_path_);
 	rk_network_init(NULL);
 	rk_system_init();
+	/* 先清理残留资源，防止 kill -9 后内核状态未释放导致重启失败 */
+	RK_MPI_SYS_Exit();
+	RK_MPI_SYS_Init();
 	if (rk_param_get_int("video.source:enable_npu", 0))
 		rkipc_rockiva_init();
 	if (rk_param_get_int("video.source:enable_aiq", 1)) {
@@ -165,7 +168,6 @@ int main(int argc, char **argv) {
 		if (rk_param_get_int("isp:init_form_ini", 1))
 			rk_isp_set_from_ini(0);
 	}
-	RK_MPI_SYS_Init();
 	rk_video_init();
 	if (rk_param_get_int("audio.0:enable", 0))
 		rkipc_audio_init();

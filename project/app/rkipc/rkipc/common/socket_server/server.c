@@ -5850,7 +5850,13 @@ int rkipc_server_init(void) {
 
 int rkipc_server_deinit(void) {
 	RkIpcServerRun = 0;
-	usleep(500 * 1000);
+	/* 关闭监听 socket，使阻塞的 accept() 返回 -1，线程才能退出 */
+	if (listen_fd >= 0) {
+		close(listen_fd);
+		listen_fd = -1;
+	}
+	/* 等待线程退出 */
+	usleep(100 * 1000);
 	if (RkIpcServerTid == 0)
 		LOG_INFO("rkipc_server_deinit success\n");
 	else
