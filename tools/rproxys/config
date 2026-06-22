@@ -1,0 +1,5 @@
+devPort=9001
+proxyPort=9002
+queryPort=9003
+portRangeStart=9100
+portRangeEnd=9999
