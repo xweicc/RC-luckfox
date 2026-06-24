@@ -5,7 +5,7 @@ $(eval $(call MACRO_CHECK_ENABLE_PKG, RK_ENABLE_EUDEV))
 
 
 # Enable build adbd debug tool
-CONFIG_SYSDRV_ENABLE_ADBD=y
+CONFIG_SYSDRV_ENABLE_ADBD=n
 $(eval $(call MACRO_CHECK_ENABLE_PKG, RK_ENABLE_ADBD))
 
 
