@@ -1,0 +1,53 @@
+#!/bin/sh
+#
+# remote_control    Starts remote_control service.
+#
+# TCP server on port 5103 for remote control car.
+# Controls motor, steering servo, and light via PWM.
+# rproxyc is auto-started by remote_control after IMEI is obtained.
+#
+
+# Make sure the program exists
+[ -f /oem/usr/bin/remote_control ] || exit 0
+
+umask 077
+
+export LD_LIBRARY_PATH=/oem/usr/lib
+
+start() {
+	printf "Starting remote_control: "
+	/oem/usr/bin/remote_control &
+	touch /var/lock/remote_control
+	echo "OK"
+}
+
+stop() {
+	printf "Stopping remote_control: "
+	killall remote_control
+	sleep 1
+	killall -9 remote_control 2>/dev/null
+	rm -f /var/lock/remote_control
+	echo "OK"
+}
+
+restart() {
+	stop
+	start
+}
+
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  restart|reload)
+	restart
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $?
