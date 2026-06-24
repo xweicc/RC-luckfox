@@ -107,6 +107,8 @@ static void spk_ctrl_disable(void) {
 
 static volatile int g_audio_running = 0;
 static volatile int g_is_playing = 0;   /* 播放中标识，send 线程据此暂停录音 */
+static volatile int g_capture_enabled = 0;  /* Capture enabled flag for lazy startup */
+static volatile int g_playback_enabled = 0; /* Playback enabled flag for lazy startup */
 static int g_client_fd = -1;
 static int g_server_fd = -1;
 static pthread_t g_audio_thread_id = 0;
@@ -196,10 +198,30 @@ static int alsa_set_params(snd_pcm_t *pcm, snd_pcm_stream_t stream) {
 /* ======================== 音频输入初始化 ======================== */
 
 static int audio_capture_init(void) {
+    /* 仅初始化功放 GPIO（但不开启） */
+    spk_ctrl_init();
+    LOG_INFO("ALSA capture GPIO initialized (lazy open on client connect)");
+    return 0;
+}
+
+/* ======================== 音频输出初始化 ======================== */
+
+static int audio_playback_init(void) {
+    /* 仅初始化占位，实际打开延迟到客户端连接 */
+    LOG_INFO("ALSA playback initialized (lazy open on client connect)");
+    return 0;
+}
+
+/**
+ * Enable audio capture (called on client connect) - lazy startup to save CPU
+ */
+static int audio_capture_enable(void) {
     int ret;
 
-    /* 初始化功放 GPIO（但不开启） */
-    spk_ctrl_init();
+    if (g_capture_enabled) {
+        LOG_WARN("Capture already enabled");
+        return 0;
+    }
 
     ret = snd_pcm_open(&g_pcm_capture, ALSA_PCM_DEVICE,
                        SND_PCM_STREAM_CAPTURE, 0);
@@ -222,14 +244,39 @@ static int audio_capture_init(void) {
         return -1;
     }
 
-    LOG_INFO("ALSA capture initialized: %s", ALSA_PCM_DEVICE);
+    g_capture_enabled = 1;
+    LOG_INFO("=== ALSA capture enabled (lazy startup on client connect) ===");
     return 0;
 }
 
-/* ======================== 音频输出初始化 ======================== */
+/**
+ * Disable audio capture (called on client disconnect) - save CPU when idle
+ */
+static void audio_capture_disable(void) {
+    if (!g_capture_enabled) {
+        return;
+    }
 
-static int audio_playback_init(void) {
+    LOG_INFO("Disabling ALSA capture (client disconnected)...");
+    if (g_pcm_capture) {
+        snd_pcm_drop(g_pcm_capture);
+        snd_pcm_close(g_pcm_capture);
+        g_pcm_capture = NULL;
+    }
+    g_capture_enabled = 0;
+    LOG_INFO("=== ALSA capture disabled (save CPU) ===");
+}
+
+/**
+ * Enable audio playback (called on client connect) - lazy startup
+ */
+static int audio_playback_enable(void) {
     int ret;
+
+    if (g_playback_enabled) {
+        LOG_WARN("Playback already enabled");
+        return 0;
+    }
 
     ret = snd_pcm_open(&g_pcm_playback, ALSA_PCM_DEVICE,
                        SND_PCM_STREAM_PLAYBACK, 0);
@@ -252,8 +299,27 @@ static int audio_playback_init(void) {
         return -1;
     }
 
-    LOG_INFO("ALSA playback initialized: %s", ALSA_PCM_DEVICE);
+    g_playback_enabled = 1;
+    LOG_INFO("=== ALSA playback enabled (lazy startup on client connect) ===");
     return 0;
+}
+
+/**
+ * Disable audio playback (called on client disconnect) - save resources when idle
+ */
+static void audio_playback_disable(void) {
+    if (!g_playback_enabled) {
+        return;
+    }
+
+    LOG_INFO("Disabling ALSA playback (client disconnected)...");
+    if (g_pcm_playback) {
+        snd_pcm_drop(g_pcm_playback);
+        snd_pcm_close(g_pcm_playback);
+        g_pcm_playback = NULL;
+    }
+    g_playback_enabled = 0;
+    LOG_INFO("=== ALSA playback disabled (save resources) ===");
 }
 
 /* ======================== 发送音频线程（采集 → 客户端） ======================== */
@@ -438,10 +504,27 @@ static void handle_client(int client_fd) {
     LOG_INFO("Client connected: %s:%d",
              inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
+    /* Lazy enable audio on client connect - saves CPU when idle */
+    if (audio_capture_enable() != 0) {
+        LOG_ERR("Failed to enable audio capture");
+        close(client_fd);
+        g_client_fd = -1;
+        return;
+    }
+    if (audio_playback_enable() != 0) {
+        LOG_ERR("Failed to enable audio playback");
+        audio_capture_disable();
+        close(client_fd);
+        g_client_fd = -1;
+        return;
+    }
+
     spk_ctrl_enable();
 
     if (pthread_create(&send_tid, NULL, audio_send_thread, NULL) != 0) {
         LOG_ERR("Failed to create send thread");
+        audio_capture_disable();
+        audio_playback_disable();
         close(client_fd);
         g_client_fd = -1;
         return;
@@ -451,6 +534,8 @@ static void handle_client(int client_fd) {
         LOG_ERR("Failed to create recv thread");
         g_audio_running = 0;
         pthread_join(send_tid, NULL);
+        audio_capture_disable();
+        audio_playback_disable();
         close(client_fd);
         g_client_fd = -1;
         return;
@@ -463,6 +548,10 @@ static void handle_client(int client_fd) {
     g_client_fd = -1;
 
     spk_ctrl_disable();
+
+    /* Disable audio on client disconnect - save CPU when idle */
+    audio_capture_disable();
+    audio_playback_disable();
 
     LOG_INFO("Client disconnected");
 }
@@ -596,17 +685,20 @@ void audio_stop(void) {
 
     LOG_INFO("Stopping audio service...");
 
-    g_audio_running = 0;
-
+    /* 先关闭 fd，唤醒阻塞的 accept/recv */
     if (g_client_fd >= 0) {
+        shutdown(g_client_fd, SHUT_RDWR);  /* 立即中断 recv */
         close(g_client_fd);
         g_client_fd = -1;
     }
 
     if (g_server_fd >= 0) {
-        close(g_server_fd);
+        close(g_server_fd);  /* 立即中断 accept */
         g_server_fd = -1;
     }
+
+    /* 再设置退出标志 */
+    g_audio_running = 0;
 
     if (g_audio_thread_id != 0) {
         pthread_join(g_audio_thread_id, NULL);

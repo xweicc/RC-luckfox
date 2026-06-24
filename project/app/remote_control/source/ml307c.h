@@ -56,6 +56,13 @@ void ml307c_deinit(void);
 int ml307c_get_gps(ml307c_gps_data_t *data);
 
 /*
+ * Get the IMEI of the modem module.
+ * Returns 1 if IMEI was copied to buf, 0 if not yet available.
+ * IMEI is fetched during initialization via AT+GSN=1.
+ */
+int ml307c_get_imei(char *buf, int size);
+
+/*
  * Get the latest signal strength in dBm.
  * Returns signal strength (negative value, e.g. -75), or 0 if unknown.
  * Updated every 5 seconds by the worker thread.

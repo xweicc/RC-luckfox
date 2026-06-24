@@ -27,26 +27,45 @@
 /* ======================== Configuration ======================== */
 
 #define TCP_PORT                5103
-#define MOTOR_PWM_FREQ_HZ      500     /* Motor PWM frequency */
-#define STEER_PWM_FREQ_HZ      50      /* Servo PWM frequency */
-#define LIGHT_PWM_FREQ_HZ      1000    /* Light PWM frequency */
 
-#define MOTOR_PWM_PERIOD_NS    (1000000000LL / MOTOR_PWM_FREQ_HZ)   /* 2000000  */
-#define STEER_PWM_PERIOD_NS    (1000000000LL / STEER_PWM_FREQ_HZ)   /* 20000000 */
-#define LIGHT_PWM_PERIOD_NS    (1000000000LL / LIGHT_PWM_FREQ_HZ)   /* 1000000  */
+/* 舵机标准信号参数 (50Hz, 20ms周期) */
+#define SERVO_PWM_FREQ_HZ      50      /* Servo PWM frequency */
+#define SERVO_PWM_PERIOD_NS    (1000000000LL / SERVO_PWM_FREQ_HZ)  /* 20000000 ns = 20ms */
+#define SERVO_MIN_US           500     /* 0.5ms */
+#define SERVO_CENTER_US        1500    /* 1.5ms (中间位置/停车) */
+#define SERVO_MAX_US           2500    /* 2.5ms */
+
+/* 电机PWM参数 (内置电调模式) */
+#define MOTOR_PWM_FREQ_HZ      500     /* Motor PWM frequency */
+#define MOTOR_PWM_PERIOD_NS    (1000000000LL / MOTOR_PWM_FREQ_HZ)   /* 2000000 ns = 2ms */
+
+/* 灯光PWM参数 (内置MOS管控制模式) */
+#define LIGHT_PWM_FREQ_HZ      1000    /* Light PWM frequency */
+#define LIGHT_PWM_PERIOD_NS    (1000000000LL / LIGHT_PWM_FREQ_HZ)   /* 1000000 ns = 1ms */
 
 #define CONTROL_TIMEOUT_MS     1000    /* Reset to defaults after 1s no data */
 #define TELEMETRY_INTERVAL_MS  1000    /* Send telemetry every 1s */
 #define GPS_INTERVAL_MS        2000    /* Send GPS every 2s */
 
-#define PWM_CHIP_MOTOR_FWD     8       /* PWM8  - motor forward  */
-#define PWM_CHIP_MOTOR_REV     9       /* PWM9  - motor reverse  */
-#define PWM_CHIP_STEER         10      /* PWM10 - steering servo */
-#define PWM_CHIP_LIGHT         0      /* PWM11 - light          */
+/* PWM芯片编号 */
+#define PWM_CHIP_CH1           10      /* PWM10 - CH1 (电机/电调) */
+#define PWM_CHIP_CH2           9       /* PWM9  - CH2 (转向) */
+#define PWM_CHIP_CH3           8       /* PWM8  - CH3 (灯光) */
+#define PWM_CHIP_CH4           0       /* PWM0  - CH4 (备用) */
 
-#define DEFAULT_THROTTLE       512     /* Stop */
+/* 模式选择: 0=内置控制, 1=外部电调/控制 */
+#define MODE_MOTOR_INTERNAL    0       /* 内置电调: PWM10(FWD)+PWM11(REV) */
+#define MODE_MOTOR_EXTERNAL    1       /* 外部电调: PWM10输出CH1舵机信号 */
+#define MODE_LIGHT_INTERNAL    0       /* 内置控制: PWM8输出占空比控制MOS管 */
+#define MODE_LIGHT_EXTERNAL    1       /* 外部控制: PWM8输出CH3舵机信号 */
+
+/* 默认模式配置 (运行时可通过 TCP 消息切换) */
+#define DEFAULT_MOTOR_MODE     MODE_MOTOR_INTERNAL
+#define DEFAULT_LIGHT_MODE     MODE_LIGHT_INTERNAL
+
+#define DEFAULT_THROTTLE       512     /* Stop (512对应1.5ms中间值) */
 #define DEFAULT_STEERING       512     /* Center */
-#define DEFAULT_LIGHT          0       /* Off */
+#define DEFAULT_LIGHT          0       /* Off (0对应0.5ms) */
 
 #define ADC_VOLTAGE_RAW        "/sys/bus/iio/devices/iio:device0/in_voltage0_raw"
 #define ADC_VOLTAGE_SCALE      "/sys/bus/iio/devices/iio:device0/in_voltage_scale"
@@ -58,6 +77,7 @@
 #define TYPE_CTRL  0x01
 #define TYPE_TELE  0x02
 #define TYPE_GPS   0x03
+#define TYPE_CONFIG 0x04   /* 配置消息: 设置电调/灯光模式 */
 
 #pragma pack(push, 1)
 typedef struct {
@@ -88,6 +108,15 @@ typedef struct {
     uint8_t  speed;        /* km/h (0~255) */
     uint8_t  checksum;     /* XOR of preceding bytes */
 } GpsPacket;               /* 30 bytes */
+
+typedef struct {
+    uint8_t  magic[2];     /* 0x5A, 0xA5 */
+    uint8_t  type;         /* 0x04 */
+    uint8_t  length;       /* 5 */
+    uint8_t  motor_mode;   /* 0=内置电调, 1=外部电调 */
+    uint8_t  light_mode;   /* 0=内置控制, 1=外部控制 */
+    uint8_t  checksum;     /* XOR of preceding bytes */
+} ConfigPacket;            /* 5 bytes */
 #pragma pack(pop)
 
 /* ======================== Global State ======================== */
@@ -96,14 +125,39 @@ static int g_server_fd = -1;
 static int g_client_fd = -1;
 
 /* duty_cycle file descriptors, kept open for efficiency */
-enum { IDX_FWD = 0, IDX_REV, IDX_STEER, IDX_LIGHT, PWM_COUNT };
+/* PWM 索引: CH1=电机正转, CH2=转向, CH3=灯光, CH4=备用 */
+enum { IDX_CH1 = 0, IDX_CH2, IDX_CH3, IDX_CH4, PWM_COUNT };
 static int g_pwm_fd[PWM_COUNT] = { -1, -1, -1, -1 };
+
+/* 内置电调模式专用的 PWM11 反转控制 fd */
+static int g_pwm11_fd = -1;
+
+/* 运行时模式控制 (可通过 TCP 消息切换) */
+static uint8_t g_motor_mode = DEFAULT_MOTOR_MODE;  /* 0=内置电调, 1=外部电调 */
+static uint8_t g_light_mode = DEFAULT_LIGHT_MODE;  /* 0=内置控制, 1=外部控制 */
+
+/* 
+ * PWM 引脚映射说明:
+ * 
+ * 内置电调模式:
+ *   - CH1 (PWM10): 电机正转
+ *   - CH2 (PWM9):  转向舵机  (固定，不受模式影响)
+ *   - CH3 (PWM8):  灯光控制  (PWM占空比/MOS管)
+ *   - CH4 (PWM0):  备用舵机
+ *   - PWM11:       电机反转  (独立控制，不占用CH索引)
+ * 
+ * 外部电调模式:
+ *   - CH1 (PWM10): 电调舵机信号
+ *   - CH2 (PWM9):  转向舵机信号 (固定，不受模式影响)
+ *   - CH3 (PWM8):  灯光舵机信号
+ *   - CH4 (PWM0):  备用舵机信号
+ */
 
 static uint16_t g_throttle = DEFAULT_THROTTLE;
 static uint16_t g_steering = DEFAULT_STEERING;
 static uint8_t  g_light    = DEFAULT_LIGHT;
 
-/* Motor direction: 1=forward, -1=backward, 0=stop */
+/* Motor direction: 1=forward, -1=backward, 0=stop (仅内置电调模式使用) */
 static int g_motor_dir = 0;
 static int64_t g_dir_change_ms = 0;  /* Direction change timestamp */
 
@@ -203,13 +257,41 @@ static void pwm_set_duty(int fd, int64_t duty_ns)
 
 static int pwm_init_all(void)
 {
+    /* 
+     * PWM 初始化配置:
+     * - CH1 (PWM10): 电机正转 (内置: 500Hz PWM, 外部: 50Hz 舵机)
+     * - CH2 (PWM9):  转向舵机 (始终: 50Hz 舵机信号)
+     * - CH3 (PWM8):  灯光控制 (内置: 1000Hz PWM, 外部: 50Hz 舵机)
+     * - CH4 (PWM0):  备用舵机 (始终: 50Hz 舵机信号)
+     * - PWM11:       电机反转 (仅内置电调模式, 500Hz PWM)
+     */
+    
+    /* CH1: PWM10 - 根据电调模式选择周期 */
+    int64_t ch1_period = (g_motor_mode == MODE_MOTOR_INTERNAL) ? 
+                         MOTOR_PWM_PERIOD_NS : SERVO_PWM_PERIOD_NS;
+    
+    /* CH2: PWM9 - 始终舵机信号 (转向) */
+    int64_t ch2_period = SERVO_PWM_PERIOD_NS;
+    
+    /* CH3: PWM8 - 根据灯光模式选择周期 */
+    int64_t ch3_period = (g_light_mode == MODE_LIGHT_INTERNAL) ? 
+                         LIGHT_PWM_PERIOD_NS : SERVO_PWM_PERIOD_NS;
+    
+    /* CH4: PWM0 - 始终舵机信号 (备用) */
+    int64_t ch4_period = SERVO_PWM_PERIOD_NS;
+    
     struct { int chip; int idx; int64_t period; } cfg[] = {
-        { PWM_CHIP_MOTOR_FWD, IDX_FWD,   MOTOR_PWM_PERIOD_NS },
-        { PWM_CHIP_MOTOR_REV, IDX_REV,   MOTOR_PWM_PERIOD_NS },
-        { PWM_CHIP_STEER,     IDX_STEER, STEER_PWM_PERIOD_NS },
-        { PWM_CHIP_LIGHT,     IDX_LIGHT, LIGHT_PWM_PERIOD_NS },
+        { 10, IDX_CH1, ch1_period },  /* PWM10 - CH1 电调/电机正转 */
+        { 9,  IDX_CH2, ch2_period },  /* PWM9  - CH2 转向 (固定) */
+        { 8,  IDX_CH3, ch3_period },  /* PWM8  - CH3 灯光 */
+        { 0,  IDX_CH4, ch4_period },  /* PWM0  - CH4 备用 */
     };
+    
+    printf("[PWM] motor mode: %s, light mode: %s\n",
+           g_motor_mode == MODE_MOTOR_INTERNAL ? "internal ESC" : "external servo",
+           g_light_mode == MODE_LIGHT_INTERNAL ? "internal MOS" : "external servo");
 
+    /* 初始化 CH1-CH4 */
     for (int i = 0; i < PWM_COUNT; i++) {
         if (pwm_init_one(cfg[i].chip, cfg[i].period) < 0) {
             fprintf(stderr, "[PWM] init chip%d failed\n", cfg[i].chip);
@@ -219,8 +301,28 @@ static int pwm_init_all(void)
         if (g_pwm_fd[cfg[i].idx] < 0)
             return -1;
     }
-    printf("[PWM] initialized (motor=%dHz, steer=%dHz, light=%dHz)\n",
-           MOTOR_PWM_FREQ_HZ, STEER_PWM_FREQ_HZ, LIGHT_PWM_FREQ_HZ);
+    
+    /* 内置电调模式: 初始化 PWM11 用于电机反转 */
+    if (g_motor_mode == MODE_MOTOR_INTERNAL) {
+        if (pwm_init_one(11, MOTOR_PWM_PERIOD_NS) < 0) {
+            fprintf(stderr, "[PWM] init PWM11 (motor reverse) failed\n");
+            return -1;
+        }
+        g_pwm11_fd = pwm_open_duty(11);
+        if (g_pwm11_fd < 0) {
+            fprintf(stderr, "[PWM] open PWM11 duty_cycle failed\n");
+            return -1;
+        }
+        printf("[PWM] PWM11 initialized for motor reverse\n");
+    } else {
+        /* 外部电调模式: 关闭 PWM11 */
+        if (g_pwm11_fd >= 0) {
+            close(g_pwm11_fd);
+            g_pwm11_fd = -1;
+        }
+    }
+    
+    printf("[PWM] initialized successfully\n");
     return 0;
 }
 
@@ -232,66 +334,95 @@ static void pwm_deinit(void)
             g_pwm_fd[i] = -1;
         }
     }
+    /* 关闭 PWM11 (内置电调模式) */
+    if (g_pwm11_fd >= 0) {
+        close(g_pwm11_fd);
+        g_pwm11_fd = -1;
+    }
 }
 
 /* ======================== Actuator Output ======================== */
 
+/* 将 0~1024 映射到舵机脉宽 (us) */
+static int64_t value_to_servo_us(uint16_t value)
+{
+    /* 0 → 500us (0.5ms), 512 → 1500us (1.5ms), 1024 → 2500us (2.5ms) */
+    return SERVO_MIN_US + (int64_t)value * (SERVO_MAX_US - SERVO_MIN_US) / 1024;
+}
+
 static void apply_motor(uint16_t throttle)
 {
-    int new_dir;
-    int64_t now = time_ms();
+    if (g_motor_mode == MODE_MOTOR_INTERNAL) {
+        /* 内置电调模式: PWM10(CH1)正转 + PWM11独立控制反转 */
+        int new_dir;
+        int64_t now = time_ms();
 
-    if (throttle > 512)
-        new_dir = 1;       /* Forward */
-    else if (throttle < 512)
-        new_dir = -1;      /* Backward */
-    else
-        new_dir = 0;       /* Stop */
+        if (throttle > 512)
+            new_dir = 1;       /* Forward */
+        else if (throttle < 512)
+            new_dir = -1;      /* Backward */
+        else
+            new_dir = 0;       /* Stop */
 
-    /* Within 1s of direction change, keep stopping to protect motor */
-    if (g_dir_change_ms > 0 && now - g_dir_change_ms < 1000) {
-        new_dir = 0;  /* Force stop */
-    }
-    /* 1s protection period expired, update direction */
-    else if (g_dir_change_ms > 0) {
+        /* Within 1s of direction change, keep stopping to protect motor */
+        if (g_dir_change_ms > 0 && now - g_dir_change_ms < 1000) {
+            new_dir = 0;  /* Force stop */
+        }
+        /* 1s protection period expired, update direction */
+        else if (g_dir_change_ms > 0) {
+            g_motor_dir = new_dir;
+            g_dir_change_ms = 0;
+        }
+
+        /* Direction change: forward<->backward, record time and force stop */
+        if (g_motor_dir != 0 && new_dir != 0 && g_motor_dir != new_dir) {
+            g_dir_change_ms = now;
+            new_dir = 0;  /* Force stop */
+        }
+
         g_motor_dir = new_dir;
-        g_dir_change_ms = 0;
-    }
 
-    /* Direction change: forward<->backward, record time and force stop */
-    if (g_motor_dir != 0 && new_dir != 0 && g_motor_dir != new_dir) {
-        g_dir_change_ms = now;
-        new_dir = 0;  /* Force stop */
-    }
-
-    g_motor_dir = new_dir;
-
-    if (new_dir == 1) {
-        /* Forward: PWM8 outputs PWM, PWM9 fixed low */
-        pwm_set_duty(g_pwm_fd[IDX_FWD], (int64_t)(throttle - 512) * MOTOR_PWM_PERIOD_NS / 512);
-        pwm_set_duty(g_pwm_fd[IDX_REV], 0);
-    } else if (new_dir == -1) {
-        /* Backward: PWM9 outputs PWM, PWM8 fixed low */
-        pwm_set_duty(g_pwm_fd[IDX_FWD], 0);
-        pwm_set_duty(g_pwm_fd[IDX_REV], (int64_t)(512 - throttle) * MOTOR_PWM_PERIOD_NS / 512);
+        if (new_dir == 1) {
+            /* Forward: PWM10(CH1) outputs PWM, PWM11 fixed low */
+            pwm_set_duty(g_pwm_fd[IDX_CH1], (int64_t)(throttle - 512) * MOTOR_PWM_PERIOD_NS / 512);
+            pwm_set_duty(g_pwm11_fd, 0);
+        } else if (new_dir == -1) {
+            /* Backward: PWM11 outputs PWM, PWM10(CH1) fixed low */
+            pwm_set_duty(g_pwm_fd[IDX_CH1], 0);
+            pwm_set_duty(g_pwm11_fd, (int64_t)(512 - throttle) * MOTOR_PWM_PERIOD_NS / 512);
+        } else {
+            /* Stop: both low */
+            pwm_set_duty(g_pwm_fd[IDX_CH1], 0);
+            pwm_set_duty(g_pwm11_fd, 0);
+        }
     } else {
-        /* Stop: both low */
-        pwm_set_duty(g_pwm_fd[IDX_FWD], 0);
-        pwm_set_duty(g_pwm_fd[IDX_REV], 0);
+        /* 外部电调模式: PWM10(CH1) 输出标准舵机信号 */
+        /* 512(中间值) → 1.5ms 停车, 0 → 0.5ms 最大后退, 1024 → 2.5ms 最大前进 */
+        int64_t pulse_us = value_to_servo_us(throttle);
+        pwm_set_duty(g_pwm_fd[IDX_CH1], pulse_us * 1000);  /* us → ns */
     }
 }
 
 static void apply_steering(uint16_t steering)
 {
-    /* Pulse width: 0.5ms(0) ~ 1.5ms(512) ~ 2.5ms(1024) */
-    int64_t duty = 500000LL + (int64_t)steering * 2000000LL / 1024;
-    pwm_set_duty(g_pwm_fd[IDX_STEER], duty);
+    /* PWM9 始终作为 CH2 转向舵机信号 (不受电机模式影响) */
+    int64_t pulse_us = value_to_servo_us(steering);
+    pwm_set_duty(g_pwm_fd[IDX_CH2], pulse_us * 1000);  /* us → ns */
 }
 
 static void apply_light(uint8_t light)
 {
-    static const int64_t duty_table[] = { 0, 200000, 500000, 1000000 };
-    pwm_set_duty(g_pwm_fd[IDX_LIGHT], duty_table[light > 3 ? 3 : light]);
+    if (g_light_mode == MODE_LIGHT_INTERNAL) {
+        /* 内置控制模式: PWM8 直接输出占空比控制 MOS 管 */
+        static const int64_t duty_table[] = { 0, 200000, 500000, 1000000 };  /* 0%, 20%, 50%, 100% */
+        pwm_set_duty(g_pwm_fd[IDX_CH3], duty_table[light > 3 ? 3 : light]);
+    } else {
+        /* 外部控制模式: PWM8 作为 CH3 标准舵机信号 */
+        /* light: 0~3 映射到 0.5ms~2.5ms */
+        uint16_t value = (uint32_t)light * 1024 / 3;  /* 0→0, 1→341, 2→682, 3→1024 */
+        int64_t pulse_us = value_to_servo_us(value);
+        pwm_set_duty(g_pwm_fd[IDX_CH3], pulse_us * 1000);  /* us → ns */
+    }
 }
 
 static void apply_all(void)
@@ -393,6 +524,55 @@ static int parse_control(const uint8_t *buf, int len)
     return 0;
 }
 
+/* Parse config packets. Returns bytes consumed, 0 if no valid frame. */
+static int parse_config(const uint8_t *buf, int len)
+{
+    for (int i = 0; i <= len - (int)sizeof(ConfigPacket); i++) {
+        if (buf[i] != MAGIC_0 || buf[i + 1] != MAGIC_1)
+            continue;
+        if (buf[i + 2] != TYPE_CONFIG)
+            continue;
+
+        ConfigPacket *pkt = (ConfigPacket *)(buf + i);
+        if (pkt->length != sizeof(ConfigPacket))
+            continue;
+        if (xor_checksum(buf + i, sizeof(ConfigPacket) - 1) != pkt->checksum)
+            continue;
+
+        /* Valid config frame - update modes */
+        if (pkt->motor_mode > 1 || pkt->light_mode > 1) {
+            fprintf(stderr, "[CONFIG] invalid mode: motor=%d, light=%d\n", 
+                    pkt->motor_mode, pkt->light_mode);
+            return i + sizeof(ConfigPacket);
+        }
+
+        /* Check if modes changed */
+        if (pkt->motor_mode != g_motor_mode || pkt->light_mode != g_light_mode) {
+            printf("[CONFIG] mode change: motor %d->%d, light %d->%d\n",
+                   g_motor_mode, pkt->motor_mode,
+                   g_light_mode, pkt->light_mode);
+            
+            /* Update modes */
+            g_motor_mode = pkt->motor_mode;
+            g_light_mode = pkt->light_mode;
+            
+            /* Reinitialize PWM with new modes */
+            pwm_deinit();
+            if (pwm_init_all() < 0) {
+                fprintf(stderr, "[CONFIG] PWM reinit failed!\n");
+            } else {
+                printf("[CONFIG] PWM reinitialized successfully\n");
+            }
+            
+            /* Reset to defaults after mode change */
+            set_defaults();
+        }
+
+        return i + sizeof(ConfigPacket);
+    }
+    return 0;
+}
+
 /* ======================== TCP Server ======================== */
 
 static int tcp_init(void)
@@ -453,12 +633,81 @@ static void disconnect_client(void)
     set_defaults();
 }
 
+/* ======================== Proxy Config ======================== */
+
+#define PROXY_CONF_PATH "/etc/proxy.conf"
+
+typedef struct {
+    char host[64];
+    int  port;
+} proxy_config_t;
+
+static int parse_proxy_config(proxy_config_t *cfg)
+{
+    FILE *fp = fopen(PROXY_CONF_PATH, "r");
+    if (!fp) {
+        fprintf(stderr, "[PROXY] %s not found, rproxyc will not start\n",
+                PROXY_CONF_PATH);
+        return -1;
+    }
+
+    cfg->host[0] = '\0';
+    cfg->port = 0;
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        /* Skip comments and empty lines */
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+            continue;
+
+        /* Parse host=xxx */
+        if (strncmp(line, "host=", 5) == 0) {
+            char *val = line + 5;
+            /* Remove trailing whitespace/newline */
+            char *end = val + strlen(val) - 1;
+            while (end > val && (*end == '\n' || *end == '\r' || *end == ' '))
+                *end-- = '\0';
+            if (strlen(val) > 0 && strlen(val) < sizeof(cfg->host))
+                strncpy(cfg->host, val, sizeof(cfg->host) - 1);
+        }
+        /* Parse port=xxx */
+        else if (strncmp(line, "port=", 5) == 0) {
+            int port = atoi(line + 5);
+            if (port > 0 && port < 65536)
+                cfg->port = port;
+        }
+    }
+
+    fclose(fp);
+
+    /* Validate config */
+    if (cfg->host[0] == '\0' || cfg->port == 0) {
+        fprintf(stderr, "[PROXY] invalid config (host=%s, port=%d), rproxyc will not start\n",
+                cfg->host, cfg->port);
+        return -1;
+    }
+
+    printf("[PROXY] loaded from %s: %s:%d\n", PROXY_CONF_PATH, cfg->host, cfg->port);
+    return 0;
+}
+
 /* ======================== Main Loop ======================== */
 
 static void signal_handler(int sig)
 {
     (void)sig;
     g_running = 0;
+    
+    /* 强制关闭所有 fd，立即唤醒阻塞的系统调用 */
+    if (g_client_fd >= 0) {
+        shutdown(g_client_fd, SHUT_RDWR);
+        close(g_client_fd);
+        g_client_fd = -1;
+    }
+    if (g_server_fd >= 0) {
+        close(g_server_fd);
+        g_server_fd = -1;
+    }
 }
 
 int main(void)
@@ -476,6 +725,42 @@ int main(void)
     /* Initialize ML307C (RNDIS + GNSS) */
     if (ml307c_init() < 0)
         fprintf(stderr, "ML307C init failed, GPS will use default\n");
+
+    /* Wait for IMEI and start rproxyc */
+    {
+        proxy_config_t proxy_cfg;
+        if (parse_proxy_config(&proxy_cfg) != 0) {
+            fprintf(stderr, "[MAIN] proxy config failed, skip rproxyc\n");
+        } else {
+            char imei[32] = {0};
+            printf("[MAIN] waiting for IMEI...\n");
+            for (int i = 0; i < 120 && g_running; i++) {
+                if (ml307c_get_imei(imei, sizeof(imei))) {
+                    if (system("pidof rproxyc > /dev/null 2>&1") == 0) {
+                        printf("[MAIN] rproxyc already running, skip\n");
+                    } else {
+                        printf("[MAIN] starting rproxyc with SN=%s, proxy=%s:%d\n", 
+                               imei, proxy_cfg.host, proxy_cfg.port);
+                        char cmd[256];
+                        snprintf(cmd, sizeof(cmd),
+                                 "/oem/usr/bin/rproxyc %s %s %d &", 
+                                 imei, proxy_cfg.host, proxy_cfg.port);
+                        system(cmd);
+                    }
+                    break;
+                }
+                /* 使用可中断睡眠，每秒检查一次 g_running */
+                for (int j = 0; j < 10 && g_running; j++)
+                    usleep(100000);  /* 100ms * 10 = 1s */
+            }
+            if (!g_running) {
+                printf("[MAIN] interrupted during IMEI wait, shutting down\n");
+                goto cleanup;
+            }
+            if (imei[0] == '\0')
+                fprintf(stderr, "[MAIN] IMEI timeout, rproxyc not started\n");
+        }
+    }
 
     /* Initialize Audio (TCP 5102) */
     if (audio_init() < 0)
@@ -527,7 +812,14 @@ int main(void)
             } else {
                 rx_len += n;
                 g_last_recv_ms = time_ms();
+                
+                /* Parse control packets */
                 int consumed = parse_control(rx_buf, rx_len);
+                if (consumed == 0) {
+                    /* Try parse config packets */
+                    consumed = parse_config(rx_buf, rx_len);
+                }
+                
                 if (consumed > 0) {
                     rx_len -= consumed;
                     if (rx_len > 0)
@@ -580,6 +872,7 @@ int main(void)
     printf("\n[MAIN] shutting down...\n");
     disconnect_client();
     
+cleanup:
     /* Stop audio threads */
     audio_stop();
     

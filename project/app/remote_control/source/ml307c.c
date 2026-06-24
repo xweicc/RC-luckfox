@@ -62,6 +62,10 @@ static int16_t  g_signal_dbm = 0;      /* Signal strength in dBm */
 static int64_t  g_signal_update_ms = 0; /* Last update timestamp */
 static pthread_mutex_t g_signal_mtx = PTHREAD_MUTEX_INITIALIZER;
 
+/* IMEI (set once during init, thread-safe read) */
+static char     g_imei[32] = {0};
+static pthread_mutex_t g_imei_mtx = PTHREAD_MUTEX_INITIALIZER;
+
 /* Worker thread */
 static pthread_t     g_worker_tid;
 static volatile int  g_worker_running;
@@ -408,6 +412,43 @@ static int wait_network(int timeout_sec)
     return -1;
 }
 
+static int get_imei(void)
+{
+    int n = at_send_worker("AT+GSN=1\r\n", AT_TIMEOUT_MS);
+    if (n < 0 || !resp_has_ok(g_at_resp)) {
+        fprintf(stderr, "[ML307C] get IMEI failed\n");
+        return -1;
+    }
+
+    /* Parse +GSN: <imei> */
+    char *p = strstr(g_at_resp, "+GSN:");
+    if (!p) {
+        fprintf(stderr, "[ML307C] IMEI not found in response\n");
+        return -1;
+    }
+    p += 5;  /* skip "+GSN:" */
+    while (*p == ' ') p++;
+
+    char imei[32] = {0};
+    int i = 0;
+    while (*p && *p != '\n' && *p != '\r' && i < (int)sizeof(imei) - 1)
+        imei[i++] = *p++;
+    imei[i] = '\0';
+
+    if (i == 0) {
+        fprintf(stderr, "[ML307C] IMEI is empty\n");
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_imei_mtx);
+    strncpy(g_imei, imei, sizeof(g_imei) - 1);
+    g_imei[sizeof(g_imei) - 1] = '\0';
+    pthread_mutex_unlock(&g_imei_mtx);
+
+    printf("[ML307C] IMEI: %s\n", imei);
+    return 0;
+}
+
 static int rndis_dial(void)
 {
     if (at_ok_worker("AT+MDIALUPCFG=\"mode\",0\r\n", AT_TIMEOUT_MS) < 0) {
@@ -426,11 +467,17 @@ static int rndis_dial(void)
     else
         printf("[ML307C] dial OK, awaiting IP...\n");
 
+    /* Skip udhcpc if interface already has an IP */
+    if (system("ifconfig " RNDIS_IFACE " | grep -q 'inet addr' 2>/dev/null") == 0) {
+        printf("[ML307C] %s already has IP, skip udhcpc\n", RNDIS_IFACE);
+        return 0;
+    }
+
     printf("[ML307C] running udhcpc on %s...\n", RNDIS_IFACE);
     /* Kill existing udhcpc processes to avoid duplicates */
     system("killall udhcpc 2>/dev/null");
     ml307c_sleep(500);  /* Wait for old processes to exit */
-    
+
     int ret = system("udhcpc -i " RNDIS_IFACE " -b -t 10 -T 3 2>/dev/null");
     if (ret != 0)
         fprintf(stderr, "[ML307C] DHCP failed (non-fatal)\n");
@@ -543,6 +590,10 @@ static int ml307c_do_init(void)
     /* Wait for network */
     if (wait_network(60) < 0)
         fprintf(stderr, "[ML307C] no network, continuing anyway\n");
+
+    /* Get IMEI */
+    if (get_imei() < 0)
+        fprintf(stderr, "[ML307C] IMEI fetch failed (non-fatal)\n");
 
     /* RNDIS dial-up */
     if (rndis_dial() < 0)
@@ -673,7 +724,7 @@ static void *worker_thread(void *arg)
                     continue;
                 }
                 pthread_mutex_unlock(&g_at_cmd_mtx);
-                usleep(10000);  /* 10ms */
+                usleep(100000);  /* 100ms - reduce idle polling CPU */
                 continue;
             }
             if (errno == EINTR) continue;
@@ -775,6 +826,21 @@ int ml307c_get_gps(ml307c_gps_data_t *data)
  * Get the latest signal strength in dBm.
  * Returns signal strength (negative value, e.g. -75), or 0 if unknown.
  */
+int ml307c_get_imei(char *buf, int size)
+{
+    if (!buf || size <= 0) return 0;
+
+    pthread_mutex_lock(&g_imei_mtx);
+    if (g_imei[0] != '\0') {
+        strncpy(buf, g_imei, size - 1);
+        buf[size - 1] = '\0';
+        pthread_mutex_unlock(&g_imei_mtx);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_imei_mtx);
+    return 0;
+}
+
 int16_t ml307c_get_signal(void)
 {
     int16_t signal = 0;
