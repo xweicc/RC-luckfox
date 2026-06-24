@@ -284,6 +284,14 @@ static void *rkipc_get_vi_draw_send_venc(void *arg) {
 	memset(&ba_result, 0, sizeof(ba_result));
 	memset(&param, 0, sizeof(im_handle_param_t));
 	while (g_video_run_) {
+		// Check if any TCP client needs stream.1 (sub-stream with draw)
+		int client_connected = (__atomic_load_n(&tcp_video_client_fd[1], __ATOMIC_ACQUIRE) >= 0);
+		if (!client_connected) {
+			// No client: sleep to save CPU
+			usleep(100000);
+			continue;
+		}
+
 		// 5.get the frame
 		ret = RK_MPI_VI_GetChnFrame(pipe_id_, VIDEO_PIPE_1, &stViFrame, 1000);
 		if (ret == RK_SUCCESS) {
@@ -3523,7 +3531,7 @@ static int usb_camera_find_device(int *fd_out, int *out_width, int *out_height, 
 	};
 	int res_count = sizeof(res_table) / sizeof(res_table[0]);
 
-	for (int i = 0; i < 10; i++) {
+	for (int i = 0; i < 32; i++) {
 		snprintf(dev_path, sizeof(dev_path), "/dev/video%d", i);
 		int fd = open(dev_path, O_RDWR);
 		if (fd < 0)
@@ -3533,6 +3541,13 @@ static int usb_camera_find_device(int *fd_out, int *out_width, int *out_height, 
 		if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0 ||
 		    !(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
 		    !(cap.capabilities & V4L2_CAP_STREAMING)) {
+			close(fd);
+			continue;
+		}
+
+		// Skip non-UVC devices (e.g., MIPI CSI sensors)
+		if (strncmp((char *)cap.driver, "uvcvideo", 8) != 0) {
+			LOG_INFO("Skipping non-UVC device %s (driver: %s)\n", dev_path, cap.driver);
 			close(fd);
 			continue;
 		}
@@ -3884,39 +3899,34 @@ static void *usb_camera_encode_thread(void *arg) {
 	int consecutive_errors = 0;
 
 	while (g_video_run_) {
-		// === Phase 1: Device discovery + V4L2 init (usb_camera_init handles both) ===
+		// === Phase 1: Wait for TCP client ===
+		int client_connected = (__atomic_load_n(&tcp_video_client_fd[2], __ATOMIC_ACQUIRE) >= 0);
+		if (!client_connected) {
+			usleep(100000);
+			continue;
+		}
+
+		// === Phase 2: Device discovery + V4L2 init ===
 		if (usb_camera_init() != 0) {
-			if (g_video_run_)
-				LOG_INFO("USB camera: no device found, retrying in 3s...\n");
+			LOG_INFO("USB camera: no device found, retrying in 3s...\n");
 			for (int i = 0; i < 30 && g_video_run_; i++)
 				usleep(100000);
 			continue;
 		}
 
-		LOG_INFO("USB camera: device ready (%dx%d @%dfps), waiting for TCP client...\n",
+		LOG_INFO("USB camera: device ready (%dx%d @%dfps)\n",
 		         usb_cam_width_, usb_cam_height_, usb_cam_fps_);
 		consecutive_errors = 0;
 		vdec_created = 0;
 		venc_created = 0;
 
-		// === Phase 2: Encode loop (runs until disconnect or exit) ===
+		// === Phase 3: Encode loop (runs until TCP disconnect or error) ===
 		while (g_video_run_) {
-			int client_connected = (__atomic_load_n(&tcp_video_client_fd[2], __ATOMIC_ACQUIRE) >= 0);
+			client_connected = (__atomic_load_n(&tcp_video_client_fd[2], __ATOMIC_ACQUIRE) >= 0);
 
 			if (!client_connected) {
-				// No TCP client: stop streaming to save USB bandwidth for 4G module
-				if (usb_camera_streaming_)
-					usb_camera_stop_stream();
-				if (venc_created) {
-					usb_venc_destroy();
-					venc_created = 0;
-				}
-				if (vdec_created) {
-					vdec_jpeg_deinit();
-					vdec_created = 0;
-				}
-				usleep(50000);
-				continue;
+				LOG_INFO("USB camera: TCP client disconnected, closing device...\n");
+				break;  // -> Phase 4: full cleanup
 			}
 
 			// TCP client connected: start pipeline if not already running
@@ -3947,7 +3957,7 @@ static void *usb_camera_encode_thread(void *arg) {
 			ret = ioctl(usb_camera_fd_, VIDIOC_DQBUF, &vbuf);
 			if (ret < 0) {
 				if (errno == EAGAIN) {
-					usleep(1000);
+					usleep(10000);
 					continue;
 				}
 				LOG_ERROR("USB camera: DQBUF failed: %s (device disconnected?)\n", strerror(errno));
@@ -3997,8 +4007,8 @@ static void *usb_camera_encode_thread(void *arg) {
 			consecutive_errors = 0;  // Reset on success
 		}
 
-		// === Phase 3: Cleanup after disconnect ===
-		LOG_INFO("USB camera: cleaning up after disconnect (errors=%d)...\n", consecutive_errors);
+		// === Phase 4: Cleanup after TCP disconnect or error ===
+		LOG_INFO("USB camera: cleaning up (errors=%d)...\n", consecutive_errors);
 		if (venc_created) {
 			usb_venc_destroy();
 			venc_created = 0;
@@ -4007,13 +4017,19 @@ static void *usb_camera_encode_thread(void *arg) {
 			vdec_jpeg_deinit();
 			vdec_created = 0;
 		}
-		usb_camera_deinit();
+		usb_camera_deinit();  // Close USB device completely
 
-		// Wait before re-detecting device
+		// Wait before re-detecting
 		if (g_video_run_) {
-			LOG_INFO("USB camera: will re-detect device in 3s...\n");
-			for (int i = 0; i < 30 && g_video_run_; i++)
+			LOG_INFO("USB camera: waiting for TCP client...\n");
+			for (int i = 0; i < 100 && g_video_run_; i++) {
+				// Check if TCP client reconnected during wait
+				if (__atomic_load_n(&tcp_video_client_fd[2], __ATOMIC_ACQUIRE) >= 0) {
+					LOG_INFO("USB camera: TCP client reconnected, reopening device...\n");
+					break;
+				}
 				usleep(100000);
+			}
 		}
 	}
 
