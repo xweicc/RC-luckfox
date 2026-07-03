@@ -77,11 +77,31 @@ struct rproxyConnect{
 	struct hlist_node hashToServerSock;
 };
 
+/* UDP连接结构体 */
+struct rproxyUdpConnect{
+	__u32 localIp;              /* 本地IP */
+	__u16 localPort;            /* 本地UDP端口(网络序) */
+	__u32 serverIp;             /* 服务器IP */
+	__u16 serverPort;           /* 服务器UDP端口(网络序) */
+	
+	int localSock;              /* 本地UDP socket */
+	int serverSock;             /* 服务器UDP socket */
+	
+	struct sockaddr_in localAddr;   /* remote_control的地址 */
+	struct sockaddr_in serverAddr;  /* rproxys的地址 */
+	
+	__u8 portType;              /* 端口类型 */
+	
+	__u32 lastSendTime;         /* 上次发送时间(秒) */
+	
+	struct hlist_node hashToLocalSock;
+};
 
 struct rproxyClient{
 	struct pollfd pollArray[POLL_MAX_NUM];
 	struct timer_list timer;           /* keep alive timer */
 	struct timer_list connTimer;       /* Connect timer */
+	struct timer_list udpHeartbeatTimer;  /* UDP heartbeat timer */
 	int pollUsed;
 	int serverSock;                    /* 连接服务器的socket */
 	int serverPollIndex;               /* 在pollArray中的位置 */
@@ -94,6 +114,7 @@ struct rproxyClient{
 	__u32 localIp;                     /* 本地IP */
 	__u16 localPorts[BIND_PORT_NUM];   /* 7个本地端口(网络序): video0,video1,audio,control,videoCtrl,ssh,rearCam */
 	__u16 allocatedPorts[BIND_PORT_NUM];/* 服务器分配的端口(主机序) */
+	__u16 udpControlPort;              /* 服务器分配的UDP控制端口(主机序) */
 
 	char sn[SN_MAX_LEN];               /* 设备SN */
 	char sendBuf[MAX_BUF_LEN];
@@ -106,6 +127,8 @@ struct rproxyClient{
 
 	struct hlist_head LocalSockHashHead[CONNECT_HLIST_SIZE];
 	struct hlist_head ServerSockHashHead[CONNECT_HLIST_SIZE];
+	struct hlist_head UdpSockHashHead[CONNECT_HLIST_SIZE];
+	struct rproxyUdpConnect *udpControlConn;  /* UDP控制连接全局指针 */
 };
 
 extern struct rproxyClient rproxy;
@@ -166,5 +189,6 @@ int connectRproxyServer(void);
 int sendLoginMsg(void);
 void rproxyServerSocketClose(void);
 void rproxyReconnect(void);
+void sendUdpHeartbeat(unsigned long data);
 
 #endif  /* __RPROXY_H__ */

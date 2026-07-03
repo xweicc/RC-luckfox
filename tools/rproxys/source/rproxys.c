@@ -211,6 +211,25 @@ proxyClientConn *proxyClientFind(int sock)
 	return NULL;
 }
 
+/*
+	按端口查找proxyClientConn
+*/
+proxyClientConn *proxyClientFindByPort(__u16 port)
+{
+	struct hlist_node *pos;
+	proxyClientConn *ct;
+	int i;
+	for(i=0;i<HLIST_MAX;i++){
+		hlist_for_each(pos, &rps.proxySockHlist[i]){
+			ct=hlist_entry(pos, proxyClientConn, hashToSock);
+			if(ct->port==port && ct->state==proxyConnConfirm){
+				return ct;
+			}
+		}
+	}
+	return NULL;
+}
+
 bindClientConn *bindPortClientFind(int sock)
 {
 	struct hlist_node *pos;
@@ -251,6 +270,22 @@ bindListenerConn *bindListenerFind(int sock)
 		lt=hlist_entry(pos, bindListenerConn, hashToSock);
 		if(lt->sock==sock){
 			return lt;
+		}
+	}
+	return NULL;
+}
+
+/*
+	查找UDP监听器
+*/
+udpBindListenerConn *udpBindListenerFind(int sock)
+{
+	struct hlist_node *pos;
+	udpBindListenerConn *ult;
+	hlist_for_each(pos, &rps.udpBindListenerSockHlist[sockHash(sock)]){
+		ult=hlist_entry(pos, udpBindListenerConn, hashToSock);
+		if(ult->sock==sock){
+			return ult;
 		}
 	}
 	return NULL;
@@ -452,6 +487,73 @@ void deleteBindListener(bindListenerConn *lt)
 }
 
 /*
+	创建UDP控制端口监听器
+*/
+udpBindListenerConn *createUdpBindListener(devClientConn *ct, __u16 port)
+{
+	int sock;
+	struct sockaddr_in my_addr;
+	udpBindListenerConn *ult;
+	int optval=1;
+
+	sock=socket(AF_INET,SOCK_DGRAM,0);
+	if(sock==-1){
+		Printf("UDP socket: %s\n",strerror(errno));
+		return NULL;
+	}
+
+	bzero(&my_addr, sizeof(my_addr));
+	my_addr.sin_family = AF_INET;
+	my_addr.sin_port = htons(port);
+	my_addr.sin_addr.s_addr = INADDR_ANY;
+
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const void *)&optval, sizeof(optval));
+	if(bind(sock, (struct sockaddr *)&my_addr, sizeof(struct sockaddr))==-1){
+		Printf("UDP bind %d: %s\n",port,strerror(errno));
+		goto out;
+	}
+	setNonblock(sock);
+	if(epollAdd(sock)){
+		goto out;
+	}
+
+	ult=memMalloc(sizeof(*ult));
+	if(!ult){
+		goto out;
+	}
+
+	ult->sock=sock;
+	ult->port=port;
+	ult->portType=portTypeControl;
+	ult->devCt=ct;
+	ult->hasClient=0;
+	memset(&ult->clientAddr, 0, sizeof(ult->clientAddr));
+	memset(&ult->proxyAddr, 0, sizeof(ult->proxyAddr));
+	INIT_HLIST_NODE(&ult->hashToSock);
+	hlist_add_head(&ult->hashToSock, &rps.udpBindListenerSockHlist[sockHash(sock)]);
+
+	Printf("UDP control listener created on port %d\n", port);
+	return ult;
+
+out:
+	close(sock);
+	return NULL;
+}
+
+/*
+	删除UDP绑定监听器
+*/
+void deleteUdpBindListener(udpBindListenerConn *ult)
+{
+	if(!ult) return;
+	hlist_del(&ult->hashToSock);
+	epollDelete(ult->sock);
+	close(ult->sock);
+	Printf("UDP control listener deleted on port %d\n", ult->port);
+	memFree(ult);
+}
+
+/*
 	为设备分配7个端口并创建监听
 */
 int allocatePortsForDevice(devClientConn *ct)
@@ -499,6 +601,24 @@ int allocatePortsForDevice(devClientConn *ct)
 		Printf("%s allocated %s port %d\n",ct->sn,portTypeStr(i),ports[i]);
 	}
 
+	/* 为控制端口创建UDP监听器 */
+	ct->udpControl.udpPort = ports[portTypeControl];
+	ct->udpControl.udpListener = createUdpBindListener(ct, ports[portTypeControl]);
+	if(!ct->udpControl.udpListener){
+		Printf("createUdpBindListener failed for %s\n", ct->sn);
+		/* 释放所有已分配的端口 */
+		for(i=0;i<BIND_PORT_NUM;i++){
+			if(ct->bind[i].listener){
+				deleteBindListener(ct->bind[i].listener);
+				ct->bind[i].listener=NULL;
+			}
+			portRelease(ct->bind[i].port);
+			ct->bind[i].port=0;
+		}
+		return -1;
+	}
+	Printf("%s allocated UDP control port %d\n", ct->sn, ct->udpControl.udpPort);
+
 	/* 发送 LoginAck(包含7个端口) */
 	if(replyDevClientLoginAck(ct, ports)){
 		return -1;
@@ -523,6 +643,15 @@ void releasePortsForDevice(devClientConn *ct)
 			portRelease(ct->bind[i].port);
 			ct->bind[i].port=0;
 		}
+	}
+	/* 释放UDP控制端口 */
+	if(ct->udpControl.udpListener){
+		deleteUdpBindListener(ct->udpControl.udpListener);
+		ct->udpControl.udpListener=NULL;
+	}
+	if(ct->udpControl.udpPort){
+		Printf("%s release UDP control port %d\n", ct->sn, ct->udpControl.udpPort);
+		ct->udpControl.udpPort=0;
 	}
 }
 
@@ -841,6 +970,100 @@ int recvBindClientData(bindClientConn *ct)
 	return 0;
 }
 
+/*
+	接收UDP监听器的数据并转发给rproxyc
+*/
+int recvUdpBindListenerData(udpBindListenerConn *ult)
+{
+	char buf[MAX_BUF_LEN];
+	struct sockaddr_in client_addr;
+	socklen_t addr_len = sizeof(client_addr);
+	int ret;
+
+	ret = recvfrom(ult->sock, buf, sizeof(buf), 0,
+				   (struct sockaddr *)&client_addr, &addr_len);
+	if(ret < 0){
+		if(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN){
+			return 0;
+		}
+		Printf("UDP recvfrom error: %s\n", strerror(errno));
+		return -1;
+	}
+
+	/* 检查是否是来自rproxyc的UDP心跳包 */
+	if(ret == 6 && memcmp(buf, "UDP_HB", 6) == 0){
+		/* 第一次收到心跳包时，记录rproxyc的地址 */
+		if(ult->proxyAddr.sin_addr.s_addr == 0){
+			ult->proxyAddr = client_addr;
+			Printf("UDP proxy addr recorded: %s:%d\n",
+				ipstr(client_addr.sin_addr.s_addr), ntohs(client_addr.sin_port));
+		}else if(ult->proxyAddr.sin_addr.s_addr != client_addr.sin_addr.s_addr ||
+		         ult->proxyAddr.sin_port != client_addr.sin_port){
+			/* 地址发生变化，更新 */
+			ult->proxyAddr = client_addr;
+			Printf("UDP proxy addr changed: %s:%d\n",
+				ipstr(client_addr.sin_addr.s_addr), ntohs(client_addr.sin_port));
+		}
+		return 0;
+	}
+
+	/* 检查是否已记录rproxyc地址，没有则不转发 */
+	if(ult->proxyAddr.sin_addr.s_addr == 0){
+		Printf("Warning: UDP proxy addr not recorded yet, data discarded\n");
+		return 0;
+	}
+
+	/* 检查是否是来自rproxyc的数据(remote_control的响应) */
+	if(client_addr.sin_addr.s_addr == ult->proxyAddr.sin_addr.s_addr &&
+	   client_addr.sin_port == ult->proxyAddr.sin_port){
+		/* 来自rproxyc的数据，转发给APP */
+		if(ult->hasClient){
+			ret = sendto(ult->sock, buf, ret, 0,
+						 (struct sockaddr *)&ult->clientAddr, sizeof(ult->clientAddr));
+			if(ret < 0){
+				if(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN){
+					return 0;
+				}
+				Printf("UDP sendto APP error: %s\n", strerror(errno));
+				return -1;
+			}
+		}
+		return 0;
+	}
+
+	/* 来自APP的数据，更新APP地址并转发给rproxyc */
+	/* 第一次收到APP数据时，记录APP地址 */
+	if(ult->clientAddr.sin_addr.s_addr == 0){
+		ult->clientAddr = client_addr;
+		ult->hasClient = 1;
+		Printf("UDP APP addr recorded: %s:%d\n",
+			ipstr(client_addr.sin_addr.s_addr), ntohs(client_addr.sin_port));
+	}else if(ult->clientAddr.sin_addr.s_addr != client_addr.sin_addr.s_addr ||
+	         ult->clientAddr.sin_port != client_addr.sin_port){
+		/* 地址发生变化，更新 */
+		ult->clientAddr = client_addr;
+		Printf("UDP APP addr changed: %s:%d\n",
+			ipstr(client_addr.sin_addr.s_addr), ntohs(client_addr.sin_port));
+	}
+
+	/* 直接通过UDP转发给rproxyc */
+	if(ult->proxyAddr.sin_addr.s_addr != 0){
+		ret = sendto(ult->sock, buf, ret, 0,
+					 (struct sockaddr *)&ult->proxyAddr, sizeof(ult->proxyAddr));
+		if(ret < 0){
+			if(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN){
+				return 0;
+			}
+			Printf("UDP sendto proxy error: %s\n", strerror(errno));
+			return -1;
+		}
+	}else{
+		Printf("Warning: UDP proxy addr not recorded, data discarded\n");
+	}
+
+	return 0;
+}
+
 /* ======================== 删除连接 ======================== */
 
 void proxyClientDelete(proxyClientConn *ct);
@@ -958,6 +1181,7 @@ int proxyClientConnAdd(int sock, struct sockaddr_in *addr)
 
 	ct->proxySock=sock;
 	ct->state=proxyConnInit;
+	ct->proxyAddr=*addr;  /* 保存rproxyc的地址 */
 	setNonblock(sock);
 
 	hlist_add_head(&ct->hashToSock, &rps.proxySockHlist[sockHash(sock)]);
@@ -1475,6 +1699,18 @@ int runEpoll(int timeout)
 						}else{
 							close(newSock);
 						}
+					}
+				}
+				continue;
+			}
+
+			/* 检查是否是UDP监听端口有数据 */
+			udpBindListenerConn *ult;
+			ult=udpBindListenerFind(events[i].data.fd);
+			if(ult){
+				if(events[i].events&EPOLLIN){
+					if(recvUdpBindListenerData(ult)){
+						Printf("UDP bind listener error\n");
 					}
 				}
 				continue;

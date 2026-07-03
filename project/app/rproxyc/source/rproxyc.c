@@ -165,6 +165,90 @@ struct rproxyConnect *rproxyConnectFind(int sock)
 	return NULL;
 }
 
+/*
+	查找UDP连接
+*/
+struct rproxyUdpConnect *rproxyUdpConnectFind(int sock)
+{
+	if(rproxy.udpControlConn){
+		if(sock==rproxy.udpControlConn->localSock || sock==rproxy.udpControlConn->serverSock){
+			return rproxy.udpControlConn;
+		}
+	}
+	return NULL;
+}
+
+/*
+	接收本地UDP数据并转发到服务器
+*/
+int recvUdpLocalData(struct rproxyUdpConnect *uct)
+{
+	char buf[BUF_SIZE];
+	struct sockaddr_in localAddr;
+	socklen_t addrLen = sizeof(localAddr);
+	int ret;
+
+	ret = recvfrom(uct->localSock, buf, sizeof(buf), 0,
+				   (struct sockaddr *)&localAddr, &addrLen);
+	if(ret < 0){
+		if(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN){
+			return 0;
+		}
+		Printf("UDP recvfrom local error\n");
+		return -1;
+	}
+
+	/* 转发到服务器(rproxys) */
+	ret = sendto(uct->serverSock, buf, ret, 0,
+				 (struct sockaddr *)&uct->serverAddr, sizeof(uct->serverAddr));
+	if(ret < 0){
+		if(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN){
+			return 0;
+		}
+		Printf("UDP sendto server error\n");
+		return -1;
+	}
+
+	/* 更新发送时间 */
+	uct->lastSendTime = time(NULL);
+
+	return 0;
+}
+
+/*
+	接收服务器UDP数据并转发到本地
+*/
+int recvUdpServerData(struct rproxyUdpConnect *uct)
+{
+	char buf[BUF_SIZE];
+	struct sockaddr_in serverAddr;
+	socklen_t addrLen = sizeof(serverAddr);
+	int ret;
+
+	ret = recvfrom(uct->serverSock, buf, sizeof(buf), 0,
+				   (struct sockaddr *)&serverAddr, &addrLen);
+	if(ret < 0){
+		if(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN){
+			return 0;
+		}
+		Printf("UDP recvfrom server error\n");
+		return -1;
+	}
+
+	/* 转发到本地(remote_control) */
+	ret = sendto(uct->localSock, buf, ret, 0,
+				 (struct sockaddr *)&uct->localAddr, sizeof(uct->localAddr));
+	if(ret < 0){
+		if(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN){
+			return 0;
+		}
+		Printf("UDP sendto local error\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 
 int rproxyConnecting(__u32 ip, __u16 port)
 {
@@ -292,7 +376,7 @@ int rproxySendToLocal(struct rproxyConnect *ct)
 	}
 
 out:
-	Printf("ret=%d. left %d bytes\n",ret,ct->serverBufUsed);
+	// Printf("ret=%d. left %d bytes\n",ret,ct->serverBufUsed);
 	return 0;
 }
 
@@ -331,7 +415,7 @@ int rproxySendToServer(struct rproxyConnect *ct)
 	}
 
 out:
-	Printf("ret=%d. left %d bytes\n",ret,ct->localBufUsed);
+	// Printf("ret=%d. left %d bytes\n",ret,ct->localBufUsed);
 	return 0;
 }
 
@@ -364,7 +448,7 @@ int recvLocalData(struct rproxyConnect *ct)
 		}
 		goto send;
 	}
-	Printf("recv %d bytes:\n",len);
+	// Printf("recv %d bytes:\n",len);
 	ct->localBufUsed+=len;
 	ct->localBuf[ct->localBufUsed]=0;
 
@@ -399,7 +483,7 @@ int recvServerData(struct rproxyConnect *ct)
 		}
 		goto send;
 	}
-	Printf("recv %d bytes:\n",len);
+	// Printf("recv %d bytes:\n",len);
 
 	ct->serverBufUsed+=len;
 
@@ -478,6 +562,77 @@ int rproxyNewConnect(__u8 portType, __u32 serverIp, __u16 serverPort)
 
 Err:
 	rproxyConnectFree(ct);
+	return -1;
+}
+
+/*
+	创建UDP客户端连接(用于控制端口低延迟)
+*/
+int rproxyUdpNewConnect(void)
+{
+	struct rproxyUdpConnect *uct=memMalloc(sizeof(*uct));
+	struct sockaddr_in serverAddr;
+	struct sockaddr_in localAddr;
+
+	if(!uct){
+		return -1;
+	}
+
+	uct->localIp=rproxy.localIp;
+	uct->localPort=rproxy.localPorts[portTypeControl];
+	uct->serverIp=rproxy.serverIp;
+	uct->serverPort=htons(rproxy.udpControlPort);
+	uct->portType=portTypeControl;
+	uct->localSock=-1;
+	uct->serverSock=-1;
+	uct->lastSendTime=0;  /* 初始化发送时间 */
+
+	/* 创建本地UDP socket(连接到remote_control) */
+	uct->localSock=socket(AF_INET, SOCK_DGRAM, 0);
+	if(uct->localSock<0){
+		Printf("UDP local socket failed\n");
+		goto Err;
+	}
+	/* 连接到remote_control的UDP端口 */
+	memset(&localAddr, 0, sizeof(localAddr));
+	localAddr.sin_family=AF_INET;
+	localAddr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);  /* localhost */
+	localAddr.sin_port=rproxy.localPorts[portTypeControl];  /* remote_control的UDP端口 */
+	uct->localAddr=localAddr;  /* 保存remote_control的地址 */
+	setNonblock(uct->localSock);
+	if(pollAdd(uct->localSock)<0){
+		Printf("UDP local pollAdd failed\n");
+		goto Err;
+	}
+
+	/* 创建服务器UDP socket(连接到rproxys) */
+	uct->serverSock=socket(AF_INET, SOCK_DGRAM, 0);
+	if(uct->serverSock<0){
+		Printf("UDP server socket failed\n");
+		goto Err;
+	}
+	memset(&serverAddr, 0, sizeof(serverAddr));
+	serverAddr.sin_family=AF_INET;
+	serverAddr.sin_addr.s_addr=uct->serverIp;
+	serverAddr.sin_port=uct->serverPort;
+	uct->serverAddr=serverAddr;
+	setNonblock(uct->serverSock);
+	if(pollAdd(uct->serverSock)<0){
+		Printf("UDP server pollAdd failed\n");
+		goto Err;
+	}
+
+	Printf("UDP control connection created: local=%d, server=%s:%d\n",
+		ntohs(uct->localPort), ipstr(uct->serverIp), ntohs(uct->serverPort));
+
+	rproxy.udpControlConn = uct;  /* 设置全局指针 */
+
+	return 0;
+
+Err:
+	if(uct->localSock>=0) close(uct->localSock);
+	if(uct->serverSock>=0) close(uct->serverSock);
+	memFree(uct);
 	return -1;
 }
 
@@ -666,6 +821,24 @@ void rproxyServerSocketClose()
 	rproxy.recvBufUsed=0;
 	rproxy.sendBufUsed=0;
 	rproxy.timeoutCount=0;
+	
+	/* 删除UDP心跳定时器 */
+	del_timer(&rproxy.udpHeartbeatTimer);
+	
+	/* 清理UDP连接 */
+	if(rproxy.udpControlConn){
+		if(rproxy.udpControlConn->localSock>=0){
+			rproxyPollDelete(rproxy.udpControlConn->localSock);
+			close(rproxy.udpControlConn->localSock);
+		}
+		if(rproxy.udpControlConn->serverSock>=0){
+			rproxyPollDelete(rproxy.udpControlConn->serverSock);
+			close(rproxy.udpControlConn->serverSock);
+		}
+		memFree(rproxy.udpControlConn);
+		rproxy.udpControlConn = NULL;
+		Printf("UDP connection cleaned up\n");
+	}
 }
 
 void rproxyKeepAlive(unsigned long data)
@@ -694,6 +867,28 @@ void rproxyKeepAlive(unsigned long data)
 }
 
 /*
+	发送UDP心跳(保持NAT映射表项活跃)
+*/
+void sendUdpHeartbeat(unsigned long data)
+{
+	__u32 now = time(NULL);
+	char heartbeat[] = "UDP_HB";  /* 简单的心跳数据 */
+
+	if(rproxy.udpControlConn && rproxy.udpControlConn->serverSock>=0){
+		/* 如果超过10秒没有发送数据，发送心跳 */
+		if(now - rproxy.udpControlConn->lastSendTime >= 10){
+			sendto(rproxy.udpControlConn->serverSock, heartbeat, strlen(heartbeat), 0,
+				   (struct sockaddr *)&rproxy.udpControlConn->serverAddr, sizeof(rproxy.udpControlConn->serverAddr));
+			rproxy.udpControlConn->lastSendTime = now;
+			Printf("UDP heartbeat sent\n");
+		}
+	}
+
+	/* 重新启动定时器 */
+	mod_timer(&rproxy.udpHeartbeatTimer, jiffies + 5*HZ);
+}
+
+/*
 	处理登录响应: 解析5个分配的端口和心跳时间
 */
 int doLoginAck(void *data, int len)
@@ -712,6 +907,10 @@ int doLoginAck(void *data, int len)
 		Printf("%s port: %d\n",portTypeStr(i),ack->ports[i]);
 	}
 
+	/* UDP控制端口与控制端口相同 */
+	rproxy.udpControlPort = ack->ports[portTypeControl];
+	Printf("UDP control port: %d\n", rproxy.udpControlPort);
+
 	/* 保存代理连接端口(转为网络序, 与serverPort保持一致) */
 	rproxy.proxyPort=htons(ack->proxyPort);
 	Printf("proxyPort: %d\n",ack->proxyPort);
@@ -726,6 +925,16 @@ int doLoginAck(void *data, int len)
 	del_timer(&rproxy.timer);
 	setup_timer(&rproxy.timer, rproxyKeepAlive, 0);
 	mod_timer(&rproxy.timer, jiffies+rproxy.keepAliveTime*HZ);
+
+	/* 创建UDP控制连接 */
+	if(rproxyUdpNewConnect()==0){
+		/* 启动UDP心跳定时器 */
+		setup_timer(&rproxy.udpHeartbeatTimer, sendUdpHeartbeat, 0);
+		mod_timer(&rproxy.udpHeartbeatTimer, jiffies + 5*HZ);
+		Printf("UDP heartbeat timer started\n");
+	}else{
+		Printf("Failed to create UDP control connection\n");
+	}
 
 	return 0;
 }
@@ -967,30 +1176,44 @@ void rproxyRunPoll(int timeout)
 					return rproxyReconnect();
 				}
 			}else{
-				struct rproxyConnect *ct=rproxyConnectFind(rproxy.pollArray[i].fd);
-				if(!ct){
-					Printf("not find ct, sock=%d\n",rproxy.pollArray[i].fd);
-					close(rproxy.pollArray[i].fd);
-					rproxy.pollArray[i].fd = -1;
-				}else if(rproxy.pollArray[i].revents & POLLIN){
-					if(ct->from==dataFromLocal){
-						recvLocalData(ct);
-					}else{
-						recvServerData(ct);
-					}
-				}else if(rproxy.pollArray[i].revents & POLLOUT){
-					if(ct->from==dataFromLocal){
-						if(rproxySendToLocal(ct)){
-							rproxyConnectFree(ct);
-						}
-					}else{
-						if(rproxySendToServer(ct)){
-							rproxyConnectFree(ct);
+				/* 检查是否是UDP连接 */
+				struct rproxyUdpConnect *uct=rproxyUdpConnectFind(rproxy.pollArray[i].fd);
+				if(uct){
+					/* UDP连接 */
+					if(rproxy.pollArray[i].revents & POLLIN){
+						if(uct->localSock==rproxy.pollArray[i].fd){
+							recvUdpLocalData(uct);
+						}else if(uct->serverSock==rproxy.pollArray[i].fd){
+							recvUdpServerData(uct);
 						}
 					}
 				}else{
-					Printf("client.pollArr[%d].revents error\n",i);
-					rproxyConnectFree(ct);
+					/* TCP连接 */
+					struct rproxyConnect *ct=rproxyConnectFind(rproxy.pollArray[i].fd);
+					if(!ct){
+						Printf("not find ct, sock=%d\n",rproxy.pollArray[i].fd);
+						close(rproxy.pollArray[i].fd);
+						rproxy.pollArray[i].fd = -1;
+					}else if(rproxy.pollArray[i].revents & POLLIN){
+						if(ct->from==dataFromLocal){
+							recvLocalData(ct);
+						}else{
+							recvServerData(ct);
+						}
+					}else if(rproxy.pollArray[i].revents & POLLOUT){
+						if(ct->from==dataFromLocal){
+							if(rproxySendToLocal(ct)){
+								rproxyConnectFree(ct);
+							}
+						}else{
+							if(rproxySendToServer(ct)){
+								rproxyConnectFree(ct);
+							}
+						}
+					}else{
+						Printf("client.pollArr[%d].revents error\n",i);
+						rproxyConnectFree(ct);
+					}
 				}
 			}
 			if(--nready <= 0){

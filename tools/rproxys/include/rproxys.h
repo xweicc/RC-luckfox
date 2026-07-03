@@ -81,6 +81,20 @@ typedef struct {
 } bindListenerConn;
 
 /*
+	UDP 绑定监听器
+*/
+typedef struct {
+	struct hlist_node hashToSock;
+	int sock;
+	__u16 port;         /* 主机序 */
+	__u8  portType;     /* enum portType */
+	struct devClientConn *devCt;
+	struct sockaddr_in clientAddr;  /* APP的UDP地址 */
+	int hasClient;      /* 是否有客户端连接 */
+	struct sockaddr_in proxyAddr;  /* rproxyc的UDP地址 */
+} udpBindListenerConn;
+
+/*
 	设备连接
 */
 typedef struct devClientConn{
@@ -94,11 +108,17 @@ typedef struct devClientConn{
 	char sendBuf[MAX_BUF_LEN];
 	int sendBufUsed;
 
-	/* 7个绑定端口 */
+	/* 7个绑定端口 (TCP) */
 	struct {
 		bindListenerConn *listener;
 		__u16 port;       /* 主机序, 0=未分配 */
 	} bind[BIND_PORT_NUM];
+
+	/* UDP控制端口 */
+	struct {
+		udpBindListenerConn *udpListener;
+		__u16 udpPort;    /* 主机序, 0=未分配 */
+	} udpControl;
 
 	__u32 ip;
 	__u32 deviceIp;
@@ -118,6 +138,7 @@ typedef struct proxyClientConn{
 	int state;
 	__u16 port;         /* 主机序 */
 	bindClientConn *bindCt;
+	struct sockaddr_in proxyAddr;  /* rproxyc的地址 */
 } proxyClientConn;
 
 /*
@@ -171,6 +192,7 @@ struct reverseProxyServer{
 	struct hlist_head proxySockHlist[HLIST_MAX];
 	struct hlist_head bindSockHlist[HLIST_MAX];
 	struct hlist_head bindListenerSockHlist[HLIST_MAX];
+	struct hlist_head udpBindListenerSockHlist[HLIST_MAX];  /* UDP监听器哈希表 */
 	struct hlist_head querySockHlist[HLIST_MAX];
 };
 
