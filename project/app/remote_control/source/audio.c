@@ -353,24 +353,12 @@ static void *audio_send_thread(void *arg) {
             continue;
         }
 
-        /* 立体声 → 单声道转换（取左声道） */
+        /* 立体声 → 单声道转换（只使用左声道，RV1103 MIC0P 是左声道） */
         int16_t *stereo_samples = (int16_t *)stereo_buf;
         int16_t *mono_samples = (int16_t *)mono_buf;
-        
-        /* 调试：检查左右声道能量 */
-        static int debug_count = 0;
-        if (debug_count++ < 10) {
-            int32_t left_energy = 0, right_energy = 0;
-            for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-                left_energy += abs(stereo_samples[i * 2]);
-                right_energy += abs(stereo_samples[i * 2 + 1]);
-            }
-            LOG_INFO("[Debug] Frame #%d: Left energy=%d, Right energy=%d", 
-                     debug_count, left_energy / AUDIO_FRAME_SAMPLES, right_energy / AUDIO_FRAME_SAMPLES);
-        }
-        
+
         for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-            mono_samples[i] = stereo_samples[i * 2];  /* 取左声道 */
+            mono_samples[i] = stereo_samples[i * 2];  /* 只取左声道 */
         }
 
         /* 发送单声道数据到客户端 */
@@ -568,8 +556,8 @@ static void *audio_server_thread(void *arg) {
         int client_fd = accept(g_server_fd, (struct sockaddr *)&client_addr, &addr_len);
 
         if (client_fd < 0) {
-            if (errno == EINTR) {
-                continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;  /* accept 超时，检查 g_audio_running */
             }
             if (g_audio_running) {
                 LOG_ERR("Accept failed: %s", strerror(errno));
@@ -620,6 +608,10 @@ int audio_init(void) {
     }
 
     setsockopt(g_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    /* accept 超时 1s，确保 audio_stop 能及时退出 */
+    struct timeval accept_tv = {1, 0};
+    setsockopt(g_server_fd, SOL_SOCKET, SO_RCVTIMEO, &accept_tv, sizeof(accept_tv));
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
