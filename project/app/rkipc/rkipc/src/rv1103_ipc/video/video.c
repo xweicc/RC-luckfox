@@ -3909,9 +3909,16 @@ static void *usb_camera_encode_thread(void *arg) {
 		// === Phase 2: Device discovery + V4L2 init ===
 		if (usb_camera_init() != 0) {
 			LOG_INFO("USB camera: no device found, retrying in 3s...\n");
-			for (int i = 0; i < 30 && g_video_run_; i++)
+			for (int i = 0; i < 30 && g_video_run_; i++) {
+				// 检查 TCP 客户端是否断开，避免无效重试
+				int client_connected = (__atomic_load_n(&tcp_video_client_fd[2], __ATOMIC_ACQUIRE) >= 0);
+				if (!client_connected) {
+					LOG_INFO("USB camera: TCP client disconnected, stop retrying\n");
+					break;  // 退出重试循环，回到外层 continue
+				}
 				usleep(100000);
-			continue;
+			}
+			continue;  // 回到 Phase 1 检查客户端
 		}
 
 		LOG_INFO("USB camera: device ready (%dx%d @%dfps)\n",
