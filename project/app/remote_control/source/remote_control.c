@@ -18,6 +18,7 @@
 #include <sys/select.h>
 #include <sys/time.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include "ml307c.h"
@@ -36,8 +37,10 @@
 #define SERVO_MAX_US           2500    /* 2.5ms */
 
 /* 电机PWM参数 (内置电调模式) */
-#define MOTOR_PWM_FREQ_HZ      500     /* Motor PWM frequency */
-#define MOTOR_PWM_PERIOD_NS    (1000000000LL / MOTOR_PWM_FREQ_HZ)   /* 2000000 ns = 2ms */
+#define MOTOR_PWM_FREQ_HZ      1000    /* Motor PWM frequency */
+#define MOTOR_PWM_PERIOD_NS    (1000000000LL / MOTOR_PWM_FREQ_HZ)   /* 1000000 ns = 1ms */
+#define MOTOR_MIN_DUTY         50      /* 电机最小启动占空比 */
+#define MOTOR_DEAD_ZONE        10      /* 电机死区范围 */
 
 /* 灯光PWM参数 (内置MOS管控制模式) */
 #define LIGHT_PWM_FREQ_HZ      1000    /* Light PWM frequency */
@@ -83,21 +86,23 @@
 typedef struct {
     uint8_t  magic[2];     /* 0x5A, 0xA5 */
     uint8_t  type;         /* 0x01 */
-    uint8_t  length;       /* 10 */
+    uint8_t  length;       /* 14 */
     uint16_t throttle;     /* 0~1024, 512=stop */
     uint16_t steering;     /* 0~1024, 512=center */
     uint8_t  light;        /* 0~3 */
+    uint32_t tm;           /* Timestamp for latency calculation (ms) */
     uint8_t  checksum;     /* XOR of preceding bytes */
-} ControlPacket;           /* 10 bytes */
+} ControlPacket;           /* 14 bytes */
 
 typedef struct {
     uint8_t  magic[2];     /* 0x5A, 0xA5 */
     uint8_t  type;         /* 0x02 */
-    uint8_t  length;       /* 11 */
+    uint8_t  length;       /* 15 */
     int16_t  signal;       /* dBm, 0=not implemented */
     uint32_t voltage_mv;   /* Battery voltage in mV */
+    uint32_t tm;           /* Timestamp echoed from ControlPacket */
     uint8_t  checksum;     /* XOR of preceding bytes */
-} TelemetryPacket;         /* 11 bytes */
+} TelemetryPacket;         /* 15 bytes */
 
 typedef struct {
     uint8_t  magic[2];     /* 0x5A, 0xA5 */
@@ -123,6 +128,12 @@ typedef struct {
 
 static int g_server_fd = -1;
 static int g_client_fd = -1;
+
+/* UDP server state */
+static int g_udp_server_fd = -1;
+static struct sockaddr_in g_udp_client_addr;
+static socklen_t g_udp_client_addrlen = sizeof(g_udp_client_addr);
+static int g_udp_client_connected = 0;
 
 /* duty_cycle file descriptors, kept open for efficiency */
 /* PWM 索引: CH1=电机正转, CH2=转向, CH3=灯光, CH4=备用 */
@@ -355,22 +366,24 @@ static void apply_motor(uint16_t throttle)
     if (g_motor_mode == MODE_MOTOR_INTERNAL) {
         /* 内置电调模式: PWM10(CH1)正转 + PWM11独立控制反转 */
         int new_dir;
+        int duty;
         int64_t now = time_ms();
 
-        if (throttle > 512)
-            new_dir = 1;       /* Forward */
-        else if (throttle < 512)
-            new_dir = -1;      /* Backward */
-        else
-            new_dir = 0;       /* Stop */
+        /* 死区处理: 503-521 不输出 */
+        if (throttle > (512 + MOTOR_DEAD_ZONE)) {
+            new_dir = 1;  /* Forward */
+        } else if (throttle < (512 - MOTOR_DEAD_ZONE)) {
+            new_dir = -1; /* Backward */
+        } else {
+            new_dir = 0;  /* Stop */
+        }
 
         /* Within 1s of direction change, keep stopping to protect motor */
         if (g_dir_change_ms > 0 && now - g_dir_change_ms < 1000) {
             new_dir = 0;  /* Force stop */
         }
-        /* 1s protection period expired, update direction */
+        /* 1s protection period expired */
         else if (g_dir_change_ms > 0) {
-            g_motor_dir = new_dir;
             g_dir_change_ms = 0;
         }
 
@@ -378,18 +391,27 @@ static void apply_motor(uint16_t throttle)
         if (g_motor_dir != 0 && new_dir != 0 && g_motor_dir != new_dir) {
             g_dir_change_ms = now;
             new_dir = 0;  /* Force stop */
+            /* 立即更新方向，以便保护期后能正确切换 */
+            g_motor_dir = new_dir;
+        } else {
+            /* Normal direction update */
+            g_motor_dir = new_dir;
         }
 
-        g_motor_dir = new_dir;
-
         if (new_dir == 1) {
-            /* Forward: PWM10(CH1) outputs PWM, PWM11 fixed low */
-            pwm_set_duty(g_pwm_fd[IDX_CH1], (int64_t)(throttle - 512) * MOTOR_PWM_PERIOD_NS / 512);
-            pwm_set_duty(g_pwm11_fd, 0);
-        } else if (new_dir == -1) {
-            /* Backward: PWM11 outputs PWM, PWM10(CH1) fixed low */
+            /* Forward: PWM11 outputs PWM, PWM10(CH1) fixed low */
+            duty = throttle - 512;
+            /* 平滑启动补偿: 将11-512映射到MOTOR_MIN_DUTY-512 */
+            duty = MOTOR_MIN_DUTY + duty * (512 - MOTOR_MIN_DUTY) / 512;
             pwm_set_duty(g_pwm_fd[IDX_CH1], 0);
-            pwm_set_duty(g_pwm11_fd, (int64_t)(512 - throttle) * MOTOR_PWM_PERIOD_NS / 512);
+            pwm_set_duty(g_pwm11_fd, (int64_t)duty * MOTOR_PWM_PERIOD_NS / 512);
+        } else if (new_dir == -1) {
+            /* Backward: PWM10(CH1) outputs PWM, PWM11 fixed low */
+            duty = 512 - throttle;
+            /* 平滑启动补偿: 将11-512映射到MOTOR_MIN_DUTY-512 */
+            duty = MOTOR_MIN_DUTY + duty * (512 - MOTOR_MIN_DUTY) / 512;
+            pwm_set_duty(g_pwm_fd[IDX_CH1], (int64_t)duty * MOTOR_PWM_PERIOD_NS / 512);
+            pwm_set_duty(g_pwm11_fd, 0);
         } else {
             /* Stop: both low */
             pwm_set_duty(g_pwm_fd[IDX_CH1], 0);
@@ -406,7 +428,8 @@ static void apply_motor(uint16_t throttle)
 static void apply_steering(uint16_t steering)
 {
     /* PWM9 始终作为 CH2 转向舵机信号 (不受电机模式影响) */
-    int64_t pulse_us = value_to_servo_us(steering);
+    /* 0 → 2500us, 512 → 1500us, 1024 → 500us */
+    int64_t pulse_us = SERVO_MAX_US - (int64_t)steering * (SERVO_MAX_US - SERVO_MIN_US) / 1024;
     pwm_set_duty(g_pwm_fd[IDX_CH2], pulse_us * 1000);  /* us → ns */
 }
 
@@ -465,7 +488,7 @@ static int read_battery_mv(uint32_t *mv)
 
 /* ======================== Protocol Handling ======================== */
 
-static void build_telemetry(TelemetryPacket *pkt, uint32_t voltage_mv)
+static void build_telemetry(TelemetryPacket *pkt, uint32_t voltage_mv, uint32_t tm)
 {
     pkt->magic[0]   = MAGIC_0;
     pkt->magic[1]   = MAGIC_1;
@@ -473,6 +496,7 @@ static void build_telemetry(TelemetryPacket *pkt, uint32_t voltage_mv)
     pkt->length     = sizeof(TelemetryPacket);
     pkt->signal     = ml307c_get_signal();  /* Get signal strength from ML307C */
     pkt->voltage_mv = voltage_mv;
+    pkt->tm         = tm;  /* Echo timestamp from ControlPacket */
     pkt->checksum   = xor_checksum((const uint8_t *)pkt, sizeof(TelemetryPacket) - 1);
 }
 
@@ -491,7 +515,8 @@ static void build_gps(GpsPacket *pkt, const char *lat, const char *lon, uint8_t 
 }
 
 /* Parse control packets from buffer. Returns bytes consumed, 0 if no valid frame. */
-static int parse_control(const uint8_t *buf, int len)
+/* If tm_ptr is provided and tm != 0, store tm value for immediate response */
+static int parse_control(const uint8_t *buf, int len, uint32_t *tm_ptr)
 {
     for (int i = 0; i <= len - (int)sizeof(ControlPacket); i++) {
         if (buf[i] != MAGIC_0 || buf[i + 1] != MAGIC_1)
@@ -509,6 +534,12 @@ static int parse_control(const uint8_t *buf, int len)
         g_throttle = pkt->throttle > 1024 ? 1024 : pkt->throttle;
         g_steering = pkt->steering > 1024 ? 1024 : pkt->steering;
         g_light    = pkt->light > 3 ? 3 : pkt->light;
+        
+        /* Extract tm for immediate response */
+        if (tm_ptr && pkt->tm != 0) {
+            *tm_ptr = pkt->tm;
+        }
+        
         {
             static int64_t last_print_ms = 0;
             int64_t now = time_ms();
@@ -587,6 +618,13 @@ static int tcp_init(void)
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
 
+    /* Disable Nagle algorithm for low latency */
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    
+    /* Set low latency TOS */
+    int tos = 0x10; /* IPTOS_LOWDELAY */
+    setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
@@ -605,12 +643,48 @@ static int tcp_init(void)
     return fd;
 }
 
+static int udp_init(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { perror("UDP socket"); return -1; }
+
+    /* Allow socket reuse */
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    /* Set low latency TOS */
+    int tos = 0x10; /* IPTOS_LOWDELAY */
+    setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(TCP_PORT);  /* Same port as TCP */
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "[UDP] port %d bind failed\n", TCP_PORT);
+        perror("bind"); close(fd); return -1;
+    }
+
+    printf("[UDP] listening on port %d\n", TCP_PORT);
+    return fd;
+}
+
 static void accept_client(void)
 {
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
     int fd = accept(g_server_fd, (struct sockaddr *)&addr, &addrlen);
     if (fd < 0) { perror("accept"); return; }
+
+    /* Disable Nagle algorithm for client socket */
+    int opt = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    
+    /* Set low latency TOS for client socket */
+    int tos = 0x10; /* IPTOS_LOWDELAY */
+    setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 
     /* Kick old connection */
     if (g_client_fd >= 0) {
@@ -629,6 +703,15 @@ static void disconnect_client(void)
         close(g_client_fd);
         g_client_fd = -1;
         printf("[TCP] client disconnected\n");
+    }
+    set_defaults();
+}
+
+static void disconnect_udp_client(void)
+{
+    if (g_udp_client_connected) {
+        g_udp_client_connected = 0;
+        printf("[UDP] client disconnected\n");
     }
     set_defaults();
 }
@@ -708,6 +791,10 @@ static void signal_handler(int sig)
         close(g_server_fd);
         g_server_fd = -1;
     }
+    if (g_udp_server_fd >= 0) {
+        close(g_udp_server_fd);
+        g_udp_server_fd = -1;
+    }
 }
 
 int main(void)
@@ -776,9 +863,16 @@ int main(void)
         return 1;
     }
 
+    /* Initialize UDP server */
+    g_udp_server_fd = udp_init();
+    if (g_udp_server_fd < 0) {
+        fprintf(stderr, "[UDP] init failed, UDP control disabled\n");
+    }
+
 
     uint8_t rx_buf[64];
     int rx_len = 0;
+    uint8_t udp_buf[64];  /* UDP receive buffer */
     int64_t last_tele_ms = time_ms();
     int64_t last_gps_ms  = time_ms();
 
@@ -791,19 +885,25 @@ int main(void)
             FD_SET(g_client_fd, &fds);
             if (g_client_fd > maxfd) maxfd = g_client_fd;
         }
+        
+        /* Add UDP socket to select */
+        if (g_udp_server_fd >= 0) {
+            FD_SET(g_udp_server_fd, &fds);
+            if (g_udp_server_fd > maxfd) maxfd = g_udp_server_fd;
+        }
 
-        struct timeval tv = { 0, 50000 }; /* 50ms */
+        struct timeval tv = { 0, 10000 }; /* 10ms */
         int ret = select(maxfd + 1, &fds, NULL, NULL, &tv);
         if (ret < 0) {
             if (errno == EINTR) continue;
             perror("select"); break;
         }
 
-        /* Accept new connection */
+        /* Accept new TCP connection */
         if (FD_ISSET(g_server_fd, &fds))
             accept_client();
 
-        /* Receive client data */
+        /* Receive TCP client data */
         if (g_client_fd >= 0 && FD_ISSET(g_client_fd, &fds)) {
             int n = recv(g_client_fd, rx_buf + rx_len, sizeof(rx_buf) - rx_len, 0);
             if (n <= 0) {
@@ -814,7 +914,8 @@ int main(void)
                 g_last_recv_ms = time_ms();
                 
                 /* Parse control packets */
-                int consumed = parse_control(rx_buf, rx_len);
+                uint32_t response_tm = 0;
+                int consumed = parse_control(rx_buf, rx_len, &response_tm);
                 if (consumed == 0) {
                     /* Try parse config packets */
                     consumed = parse_config(rx_buf, rx_len);
@@ -824,6 +925,18 @@ int main(void)
                     rx_len -= consumed;
                     if (rx_len > 0)
                         memmove(rx_buf, rx_buf + consumed, rx_len);
+                    
+                    /* Immediate response if tm != 0 */
+                    if (response_tm != 0) {
+                        uint32_t mv = 0;
+                        read_battery_mv(&mv);
+                        TelemetryPacket pkt;
+                        build_telemetry(&pkt, mv, response_tm);
+                        if (send(g_client_fd, &pkt, sizeof(pkt), MSG_NOSIGNAL) < 0) {
+                            disconnect_client();
+                            rx_len = 0;
+                        }
+                    }
                 } else if (rx_len >= (int)sizeof(ControlPacket)) {
                     /* No valid frame found in full buffer, discard */
                     rx_len = 0;
@@ -831,20 +944,61 @@ int main(void)
             }
         }
 
+        /* Receive UDP client data */
+        if (g_udp_server_fd >= 0 && FD_ISSET(g_udp_server_fd, &fds)) {
+            int n = recvfrom(g_udp_server_fd, udp_buf, sizeof(udp_buf), 0,
+                            (struct sockaddr *)&g_udp_client_addr, &g_udp_client_addrlen);
+            if (n > 0) {
+                g_udp_client_connected = 1;
+                g_last_recv_ms = time_ms();
+                
+                /* Parse control packets */
+                uint32_t response_tm = 0;
+                int consumed = parse_control(udp_buf, n, &response_tm);
+                
+                if (consumed > 0 && response_tm != 0) {
+                    /* Immediate response for UDP */
+                    uint32_t mv = 0;
+                    read_battery_mv(&mv);
+                    TelemetryPacket pkt;
+                    build_telemetry(&pkt, mv, response_tm);
+                    sendto(g_udp_server_fd, &pkt, sizeof(pkt), 0,
+                          (struct sockaddr *)&g_udp_client_addr, g_udp_client_addrlen);
+                }
+            }
+        }
+
         /* Control timeout: 1s no data → reset to defaults */
-        if (g_client_fd >= 0 && time_ms() - g_last_recv_ms >= CONTROL_TIMEOUT_MS) {
+        /* Check both TCP and UDP clients */
+        int any_client_connected = (g_client_fd >= 0) || g_udp_client_connected;
+        if (any_client_connected && time_ms() - g_last_recv_ms >= CONTROL_TIMEOUT_MS) {
             set_defaults();
             g_last_recv_ms = time_ms();
+            /* Disconnect UDP client on timeout */
+            if (g_udp_client_connected) {
+                disconnect_udp_client();
+            }
         }
 
         /* Send telemetry every 1s */
-        if (g_client_fd >= 0 && time_ms() - last_tele_ms >= TELEMETRY_INTERVAL_MS) {
+        if ((g_client_fd >= 0 || g_udp_client_connected) && time_ms() - last_tele_ms >= TELEMETRY_INTERVAL_MS) {
             uint32_t mv = 0;
             read_battery_mv(&mv);
             TelemetryPacket pkt;
-            build_telemetry(&pkt, mv);
-            if (send(g_client_fd, &pkt, sizeof(pkt), MSG_NOSIGNAL) < 0)
-                disconnect_client();
+            build_telemetry(&pkt, mv, 0);  /* tm=0 for periodic telemetry */
+            
+            /* Send via TCP if connected */
+            if (g_client_fd >= 0) {
+                if (send(g_client_fd, &pkt, sizeof(pkt), MSG_NOSIGNAL) < 0)
+                    disconnect_client();
+            }
+            
+            /* Send via UDP if connected */
+            if (g_udp_client_connected && g_udp_server_fd >= 0) {
+                sendto(g_udp_server_fd, &pkt, sizeof(pkt), 0,
+                      (struct sockaddr *)&g_udp_client_addr, g_udp_client_addrlen);
+            }
+            
             last_tele_ms = time_ms();
         }
 
@@ -880,6 +1034,12 @@ cleanup:
     if (g_server_fd >= 0) {
         close(g_server_fd);
         g_server_fd = -1;
+    }
+    
+    /* Close UDP server fd */
+    if (g_udp_server_fd >= 0) {
+        close(g_udp_server_fd);
+        g_udp_server_fd = -1;
     }
     
     /* Stop ML307C threads (monitor + reader) */
