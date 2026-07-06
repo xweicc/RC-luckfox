@@ -1,0 +1,12 @@
+[Unit]
+Description=rproxys proxy server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rproxys /etc/rproxys.conf
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

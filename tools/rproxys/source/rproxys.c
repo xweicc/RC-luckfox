@@ -11,6 +11,10 @@
 
 struct reverseProxyServer rps;
 
+/* Forward declarations */
+void devClientDelete(devClientConn *ct);
+void proxyClientDelete(proxyClientConn *ct);
+
 int setNonblock(int sock)
 {
 	return fcntl(sock, F_SETFL, fcntl(sock, F_GETFL, 0)|O_NONBLOCK);
@@ -308,13 +312,13 @@ int sendDataToDevClient(devClientConn *ct, void *msg, int len)
 
 	ret=send(ct->devSock,ct->sendBuf,ct->sendBufUsed,0);
 	if(!ret){
-		Printf("Connection closed by peer\n");
+		Printf("[dev %s] connection closed by peer\n",ct->sn);
 		ct->sendBufUsed=0;
 		return -1;
 	}
 	if(ret<0){
 		if(!isIgnoreErrno(errno)){
-			Printf("Connection closed by peer\n");
+			Printf("[dev %s] connection closed by peer\n",ct->sn);
 			ct->sendBufUsed=0;
 			return -1;
 		}
@@ -658,6 +662,7 @@ void releasePortsForDevice(devClientConn *ct)
 int devClientLogin(devClientConn *ct, void *data, int len)
 {
 	msg_login_t *msg=(msg_login_t *)data;
+	devClientConn *old;
 
 	if(len<(int)sizeof(msg_login_t)-sizeof(rproxy_msg_head)){
 		Printf("login data too short\n");
@@ -672,6 +677,14 @@ int devClientLogin(devClientConn *ct, void *data, int len)
 	strncpy(ct->sn, msg->sn, sizeof(ct->sn));
 
 	Printf("SN:%s\n",ct->sn);
+
+	/* Clean up old connection with same SN (if any) */
+	old = devClientConnFindBySn(ct->sn);
+	if (old) {
+		Printf("SN:%s already connected, cleaning up old connection\n", ct->sn);
+		devClientDelete(old);
+	}
+
 	hlist_add_head(&ct->hashToSn, &rps.devSnHlist[SnHash(ct->sn)]);
 
 	/* 分配7个端口并创建监听, 发送LoginAck */
@@ -694,14 +707,14 @@ int recvDevClientData(devClientConn *ct)
 
 	ret=recv(ct->devSock,ct->recvBuf+ct->recvBufUsed,sizeof(ct->recvBuf)-ct->recvBufUsed,0);
 	if(!ret){
-		Printf("Connection closed by peer\n");
+		Printf("[dev %s] connection closed by peer\n",ct->sn);
 		return -1;
 	}
 	if(ret<0){
 		if(errno==EINTR || errno==EWOULDBLOCK || errno==EAGAIN){
 			ret=0;
 		}else{
-			Printf("Connection closed by peer\n");
+			Printf("[dev %s] connection closed by peer\n",ct->sn);
 			return -1;
 		}
 	}
@@ -780,12 +793,12 @@ int sendDataToProxyClient(proxyClientConn *ct)
 
 	ret=send(ct->proxySock, ct->bindCt->recvBuf, ct->bindCt->recvBufUsed, 0);
 	if(!ret){
-		Printf("Connection closed by peer\n");
+		Printf("[proxy %s port=%d] connection closed by peer\n",portTypeStr(ct->bindCt->portType),ct->port);
 		return -1;
 	}
 	if(ret<0){
 		if(!isIgnoreErrno(errno)){
-			Printf("Connection closed by peer\n");
+			Printf("[proxy %s port=%d] connection closed by peer\n",portTypeStr(ct->bindCt->portType),ct->port);
 			return -1;
 		}
 		ret=0;
@@ -794,6 +807,10 @@ int sendDataToProxyClient(proxyClientConn *ct)
 	}
 
 	ct->bindCt->recvBufUsed-=ret;
+	mod_timer(&ct->timer, jiffies+PROXY_CONN_TIMEOUT*HZ);
+	if(ct->bindCt){
+		mod_timer(&ct->bindCt->timer, jiffies+PROXY_CONN_TIMEOUT*HZ);
+	}
 	if(ct->bindCt->recvBufUsed){
 		memmove(ct->bindCt->recvBuf, ct->bindCt->recvBuf+ret, ct->bindCt->recvBufUsed);
 		epollOutEvent(ct->proxySock,1);
@@ -812,12 +829,12 @@ int sendDataToBindClient(bindClientConn *ct)
 	assert(ct->proxyCt!=NULL);
 	ret=send(ct->sock, ct->proxyCt->recvBuf, ct->proxyCt->recvBufUsed, 0);
 	if(!ret){
-		Printf("Connection closed by peer\n");
+		Printf("[bind %s port=%d] connection closed by peer\n",portTypeStr(ct->portType),ct->port);
 		return -1;
 	}
 	if(ret<0){
 		if(!isIgnoreErrno(errno)){
-			Printf("Connection closed by peer\n");
+			Printf("[bind %s port=%d] connection closed by peer\n",portTypeStr(ct->portType),ct->port);
 			return -1;
 		}
 		epollOutEvent(ct->sock,1);
@@ -826,6 +843,8 @@ int sendDataToBindClient(bindClientConn *ct)
 	}
 
 	ct->proxyCt->recvBufUsed-=ret;
+	mod_timer(&ct->proxyCt->timer, jiffies+PROXY_CONN_TIMEOUT*HZ);
+	mod_timer(&ct->timer, jiffies+PROXY_CONN_TIMEOUT*HZ);
 	if(ct->proxyCt->recvBufUsed){
 		memmove(ct->proxyCt->recvBuf, ct->proxyCt->recvBuf+ret, ct->proxyCt->recvBufUsed);
 		epollOutEvent(ct->sock,1);
@@ -898,18 +917,19 @@ int recvProxyClientData(proxyClientConn *ct)
 	}
 	ret=recv(ct->proxySock,ct->recvBuf+ct->recvBufUsed,sizeof(ct->recvBuf)-ct->recvBufUsed,0);
 	if(!ret){
-		Printf("Connection closed by peer\n");
+		Printf("[proxy port=%d] connection closed by peer\n",ct->port);
 		return -1;
 	}
 	if(ret<0){
 		if(errno==EINTR || errno==EWOULDBLOCK || errno==EAGAIN){
 			ret=0;
 		}else{
-			Printf("Connection closed by peer\n");
+			Printf("[proxy port=%d] connection closed by peer\n",ct->port);
 			return -1;
 		}
 	}
 	ct->recvBufUsed+=ret;
+	mod_timer(&ct->timer, jiffies+PROXY_CONN_TIMEOUT*HZ);
 
 	if(ct->state==proxyConnInit){
 		if(checkProxyClientFirstData(ct)){
@@ -922,6 +942,11 @@ int recvProxyClientData(proxyClientConn *ct)
 			return -1;
 		}
 		Printf("bindClientFindPort %d ok\n",ct->port);
+
+		if(bindCt->proxyCt){
+			Printf("replacing old proxyClient port=%d sock=%d\n", bindCt->port, bindCt->proxyCt->proxySock);
+			proxyClientDelete(bindCt->proxyCt);
+		}
 
 		bindCt->proxyCt=ct;
 		ct->bindCt=bindCt;
@@ -950,18 +975,19 @@ int recvBindClientData(bindClientConn *ct)
 
 	ret=recv(ct->sock,ct->recvBuf+ct->recvBufUsed,sizeof(ct->recvBuf)-ct->recvBufUsed,0);
 	if(!ret){
-		Printf("Connection closed by peer\n");
+		Printf("[bind %s port=%d] connection closed by peer\n",portTypeStr(ct->portType),ct->port);
 		return -1;
 	}
 	if(ret<0){
 		if(errno==EINTR || errno==EWOULDBLOCK || errno==EAGAIN){
 			ret=0;
 		}else{
-			Printf("Connection closed by peer\n");
+			Printf("[bind %s port=%d] connection closed by peer\n",portTypeStr(ct->portType),ct->port);
 			return -1;
 		}
 	}
 	ct->recvBufUsed+=ret;
+	mod_timer(&ct->timer, jiffies+PROXY_CONN_TIMEOUT*HZ);
 
 	if(ct->state==proxyConnConfirm){
 		return sendDataToProxyClient(ct->proxyCt);
@@ -975,7 +1001,7 @@ int recvBindClientData(bindClientConn *ct)
 */
 int recvUdpBindListenerData(udpBindListenerConn *ult)
 {
-	char buf[MAX_BUF_LEN];
+	char buf[DEV_BUF_LEN];
 	struct sockaddr_in client_addr;
 	socklen_t addr_len = sizeof(client_addr);
 	int ret;
@@ -1058,7 +1084,7 @@ int recvUdpBindListenerData(udpBindListenerConn *ult)
 			return -1;
 		}
 	}else{
-		Printf("Warning: UDP proxy addr not recorded, data discarded\n");
+		// Printf("Warning: UDP proxy addr not recorded, data discarded\n");
 	}
 
 	return 0;
@@ -1066,10 +1092,9 @@ int recvUdpBindListenerData(udpBindListenerConn *ult)
 
 /* ======================== 删除连接 ======================== */
 
-void proxyClientDelete(proxyClientConn *ct);
-
 void bindClientDelete(bindClientConn *ct)
 {
+	Printf("bindClientDelete: %s port=%d sock=%d\n",portTypeStr(ct->portType),ct->port,ct->sock);
 	del_timer(&ct->timer);
 	hlist_del(&ct->hashToSock);
 	if(!hlist_unhashed(&ct->hashToPort)){
@@ -1089,6 +1114,7 @@ void bindClientDelete(bindClientConn *ct)
 
 void devClientDelete(devClientConn *ct)
 {
+	Printf("devClientDelete: SN=%s sock=%d\n",ct->sn,ct->devSock);
 	del_timer(&ct->timer);
 	hlist_del(&ct->hashToSock);
 	if(!hlist_unhashed(&ct->hashToSn)){
@@ -1105,6 +1131,7 @@ void devClientDelete(devClientConn *ct)
 
 void proxyClientDelete(proxyClientConn *ct)
 {
+	Printf("proxyClientDelete: %s port=%d sock=%d\n",ct->bindCt?portTypeStr(ct->bindCt->portType):"unknown",ct->port,ct->proxySock);
 	del_timer(&ct->timer);
 	hlist_del(&ct->hashToSock);
 	epollDelete(ct->proxySock);
@@ -1123,17 +1150,23 @@ void proxyClientDelete(proxyClientConn *ct)
 
 void devClientTimeout(unsigned long data)
 {
-	devClientDelete((devClientConn *)data);
+	devClientConn *ct=(devClientConn *)data;
+	Printf("[dev %s] timeout\n",ct->sn);
+	devClientDelete(ct);
 }
 
 void proxyClientTimeout(unsigned long data)
 {
-	proxyClientDelete((proxyClientConn *)data);
+	proxyClientConn *ct=(proxyClientConn *)data;
+	Printf("[proxy %s port=%d] timeout\n",ct->bindCt?portTypeStr(ct->bindCt->portType):"unknown",ct->port);
+	proxyClientDelete(ct);
 }
 
 void bindClientTimeout(unsigned long data)
 {
-	bindClientDelete((bindClientConn *)data);
+	bindClientConn *ct=(bindClientConn *)data;
+	Printf("[bind %s port=%d] timeout\n",portTypeStr(ct->portType),ct->port);
+	bindClientDelete(ct);
 }
 
 /* ======================== 添加连接 ======================== */
@@ -1839,6 +1872,9 @@ int main(int argc, char **argv)
 	if(argc==3){
 		rps.debug=atoi(argv[2]);
 	}
+
+	logInit(rps.debug);
+	atexit(logDeinit);
 
 	if(checkConfigFile()){
 		return -1;

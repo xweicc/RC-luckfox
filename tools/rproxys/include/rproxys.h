@@ -27,11 +27,14 @@
 #include <timer.h>
 
 #include "rproxy_msg_def.h"
+#include "log.h"
 
 #define HLIST_MAX  0x10000
 #define HLIST_MASK 0xFFFF
 
-#define MAX_BUF_LEN    65536
+#define DEV_BUF_LEN    8192        /* devClientConn: 控制通道, 小消息 */
+#define PROXY_BUF_LEN  (128 * 1024) /* proxyClientConn: 代理数据通道 */
+#define BIND_BUF_LEN   (128 * 1024) /* bindClientConn: 外部客户端连接 */
 #define EPOLL_MAX_NUM  1024
 
 /* 超时时间(秒) */
@@ -41,8 +44,7 @@
 #define PROXY_CONN_CONFIRM_TIMEOUT   3600
 #define QUERY_CONN_TIMEOUT           10
 
-#define Printf(format,args...) \
-	do{ if(rps.debug) printf("[%s:%d]:"format,__FUNCTION__,__LINE__,##args); }while(0)
+/* Printf 宏已移至 log.h */
 
 enum proxyConnState{
 	proxyConnInit,
@@ -63,7 +65,7 @@ typedef struct {
 	int sock;
 	__u16 port;         /* 主机序 */
 	__u8  portType;     /* enum portType */
-	char recvBuf[MAX_BUF_LEN];
+	char recvBuf[BIND_BUF_LEN];
 	int recvBufUsed;
 	int state;
 	struct proxyClientConn *proxyCt;
@@ -103,9 +105,9 @@ typedef struct devClientConn{
 	struct timer_list timer;
 	int devSock;
 	char sn[SN_MAX_LEN];
-	char recvBuf[MAX_BUF_LEN];
+	char recvBuf[DEV_BUF_LEN];
 	int recvBufUsed;
-	char sendBuf[MAX_BUF_LEN];
+	char sendBuf[DEV_BUF_LEN];
 	int sendBufUsed;
 
 	/* 7个绑定端口 (TCP) */
@@ -133,7 +135,7 @@ typedef struct proxyClientConn{
 	struct timer_list timer;
 	int proxySock;
 	char sn[SN_MAX_LEN];
-	char recvBuf[MAX_BUF_LEN];
+	char recvBuf[PROXY_BUF_LEN];
 	int recvBufUsed;
 	int state;
 	__u16 port;         /* 主机序 */

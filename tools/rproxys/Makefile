@@ -1,4 +1,4 @@
-OBJS = ./source/rproxys.o ./source/timer.o
+OBJS = ./source/rproxys.o ./source/timer.o ./source/log.o
 
 CFLAGS += -I./include -Wall
 
