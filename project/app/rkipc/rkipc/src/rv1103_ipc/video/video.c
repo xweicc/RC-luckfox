@@ -5,6 +5,7 @@
 #include "video.h"
 #include "audio.h"
 #include "rockiva.h"
+#include "log.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -376,7 +377,7 @@ static void *tcp_video_accept_thread(void *arg) {
 	char thread_name[16];
 	snprintf(thread_name, sizeof(thread_name), "TcpVideo%d", stream_id);
 	prctl(PR_SET_NAME, thread_name, 0, 0, 0);
-	LOG_INFO("TCP video accept thread started for stream %d on port %d\n", stream_id,
+	Printf("[INFO] TCP video accept thread started for stream %d on port %d\n", stream_id,
 	         stream_id == 0 ? TCP_VIDEO_PORT_0 : (stream_id == 1 ? TCP_VIDEO_PORT_1 : TCP_VIDEO_PORT_2));
 
 	while (g_video_run_) {
@@ -386,7 +387,7 @@ static void *tcp_video_accept_thread(void *arg) {
 		                       (struct sockaddr *)&client_addr, &addr_len);
 		if (client_fd < 0) {
 			if (g_video_run_ && errno != EINTR)
-				LOG_ERROR("TCP video accept error on stream %d: %s\n", stream_id, strerror(errno));
+				Printf("[ERROR] TCP video accept error on stream %d: %s\n", stream_id, strerror(errno));
 			continue;
 		}
 
@@ -400,10 +401,10 @@ static void *tcp_video_accept_thread(void *arg) {
 		// Disconnect old connection, keep only the new one
 		int old_fd = __atomic_exchange_n(&tcp_video_client_fd[stream_id], client_fd, __ATOMIC_SEQ_CST);
 		if (old_fd >= 0) {
-			LOG_INFO("TCP video.%d: disconnecting old client\n", stream_id);
+			Printf("[WARN] TCP video.%d: disconnecting old client\n", stream_id);
 			close(old_fd);
 		}
-		LOG_INFO("TCP video.%d: new client connected from %s:%d\n", stream_id,
+		Printf("[INFO] TCP video.%d: new client connected from %s:%d\n", stream_id,
 		         inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 	}
 	return NULL;
@@ -421,7 +422,7 @@ static int tcp_video_send_frame(int stream_id, void *data, unsigned int len) {
 	int ret = poll(&pfd, 1, 100); // 100ms timeout
 	if (ret <= 0) {
 		// Timeout or error, disconnect client to avoid blocking pipeline
-		LOG_INFO("TCP video.%d client too slow or disconnected (poll ret=%d, errno=%d: %s)\n",
+		Printf("[WARN] TCP video.%d client too slow or disconnected (poll ret=%d, errno=%d: %s)\n",
 		         stream_id, ret, errno, strerror(errno));
 		int expected = fd;
 		__atomic_compare_exchange_n(&tcp_video_client_fd[stream_id], &expected, -1,
@@ -436,7 +437,7 @@ static int tcp_video_send_frame(int stream_id, void *data, unsigned int len) {
 	ssize_t written = send(fd, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
 	if (written < (ssize_t)len) {
 		// Send failed, client disconnected
-		LOG_INFO("TCP video.%d client disconnected (send ret=%zd, errno=%d: %s)\n",
+		Printf("[WARN] TCP video.%d client disconnected (send ret=%zd, errno=%d: %s)\n",
 		         stream_id, written, errno, strerror(errno));
 		int expected = fd;
 		__atomic_compare_exchange_n(&tcp_video_client_fd[stream_id], &expected, -1,
@@ -454,7 +455,7 @@ static int tcp_video_server_init() {
 		int port = ports[i];
 		int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 		if (server_fd < 0) {
-			LOG_ERROR("TCP video socket create failed for stream %d: %s\n", i, strerror(errno));
+			Printf("[ERROR] TCP video socket create failed for stream %d: %s\n", i, strerror(errno));
 			return -1;
 		}
 
@@ -468,19 +469,19 @@ static int tcp_video_server_init() {
 		addr.sin_port = htons(port);
 
 		if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-			LOG_ERROR("TCP video bind port %d failed: %s\n", port, strerror(errno));
+			Printf("[ERROR] TCP video bind port %d failed: %s\n", port, strerror(errno));
 			close(server_fd);
 			return -1;
 		}
 
 		if (listen(server_fd, 1) < 0) {
-			LOG_ERROR("TCP video listen port %d failed: %s\n", port, strerror(errno));
+			Printf("[ERROR] TCP video listen port %d failed: %s\n", port, strerror(errno));
 			close(server_fd);
 			return -1;
 		}
 
 		tcp_video_server_fd[i] = server_fd;
-		LOG_INFO("TCP video server listening on port %d for video.%d\n", port, i);
+		Printf("[INFO] TCP video server listening on port %d for video.%d\n", port, i);
 	}
 
 	pthread_create(&tcp_video_thread_0, NULL, tcp_video_accept_thread, (void *)(intptr_t)0);
@@ -3624,17 +3625,17 @@ static int usb_camera_find_device(int *fd_out, int *out_width, int *out_height, 
 		}
 
 		if (found_res < 0) {
-			LOG_WARN("USB camera %s: no supported MJPG resolution found\n", dev_path);
+			Printf("[ERROR] USB camera %s: no supported MJPG resolution found\n", dev_path);
 			close(fd);
 			continue;
 		}
 
 		if (found_res > 0)
-			LOG_WARN("USB camera: requested resolution not supported, using fallback %dx%d @%dfps\n",
+			Printf("[WARN] USB camera: requested resolution not supported, using fallback %dx%d @%dfps\n",
 			         *out_width, *out_height, *out_fps);
 
 		*fd_out = fd;
-		LOG_INFO("Found USB camera: %s (MJPG %dx%d @%dfps)\n",
+		Printf("[INFO] Found USB camera: %s (MJPG %dx%d @%dfps)\n",
 		         dev_path, *out_width, *out_height, *out_fps);
 		return 0;
 	}
@@ -3654,12 +3655,12 @@ static int usb_camera_init(void) {
 	if (dev_cfg && strlen(dev_cfg) > 0) {
 		usb_camera_fd_ = open(dev_cfg, O_RDWR);
 		if (usb_camera_fd_ < 0) {
-			LOG_WARN("USB camera: cannot open %s: %s\n", dev_cfg, strerror(errno));
+			Printf("[ERROR] USB camera: cannot open %s: %s\n", dev_cfg, strerror(errno));
 			return -1;
 		}
 	} else {
 		if (usb_camera_find_device(&usb_camera_fd_, &usb_cam_width_, &usb_cam_height_, &usb_cam_fps_) < 0) {
-			LOG_WARN("USB camera: no suitable MJPG camera found\n");
+			Printf("[ERROR] USB camera: no suitable MJPG camera found\n");
 			return -1;
 		}
 	}
@@ -3673,7 +3674,7 @@ static int usb_camera_init(void) {
 	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
 	fmt.fmt.pix.field = V4L2_FIELD_NONE;
 	if (ioctl(usb_camera_fd_, VIDIOC_S_FMT, &fmt) < 0) {
-		LOG_ERROR("USB camera: VIDIOC_S_FMT failed: %s\n", strerror(errno));
+		Printf("[ERROR] USB camera: VIDIOC_S_FMT failed: %s\n", strerror(errno));
 		close(usb_camera_fd_);
 		usb_camera_fd_ = -1;
 		return -1;
@@ -3694,7 +3695,7 @@ static int usb_camera_init(void) {
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	req.memory = V4L2_MEMORY_MMAP;
 	if (ioctl(usb_camera_fd_, VIDIOC_REQBUFS, &req) < 0) {
-		LOG_ERROR("USB camera: VIDIOC_REQBUFS failed: %s\n", strerror(errno));
+		Printf("[ERROR] USB camera: VIDIOC_REQBUFS failed: %s\n", strerror(errno));
 		close(usb_camera_fd_);
 		usb_camera_fd_ = -1;
 		return -1;
@@ -3708,7 +3709,7 @@ static int usb_camera_init(void) {
 		buf.memory = V4L2_MEMORY_MMAP;
 		buf.index = i;
 		if (ioctl(usb_camera_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
-			LOG_ERROR("USB camera: VIDIOC_QUERYBUF %d failed\n", i);
+			Printf("[ERROR] USB camera: VIDIOC_QUERYBUF %d failed\n", i);
 			close(usb_camera_fd_);
 			usb_camera_fd_ = -1;
 			return -1;
@@ -3718,12 +3719,12 @@ static int usb_camera_init(void) {
 		usb_v4l2_buffer_lengths_[i] = buf.length;
 		// Queue buffer
 		if (ioctl(usb_camera_fd_, VIDIOC_QBUF, &buf) < 0) {
-			LOG_ERROR("USB camera: VIDIOC_QBUF %d failed\n", i);
+			Printf("[ERROR] USB camera: VIDIOC_QBUF %d failed\n", i);
 		}
 	}
 
 	usb_camera_available_ = 1;
-	LOG_INFO("USB camera initialized: MJPG %dx%d @%dfps\n",
+	Printf("[INFO] USB camera initialized: MJPG %dx%d @%dfps\n",
 	         usb_cam_width_, usb_cam_height_, usb_cam_fps_);
 	return 0;
 }
@@ -3733,11 +3734,11 @@ static void usb_camera_start_stream(void) {
 		return;
 	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	if (ioctl(usb_camera_fd_, VIDIOC_STREAMON, &type) < 0) {
-		LOG_ERROR("USB camera: VIDIOC_STREAMON failed: %s\n", strerror(errno));
+		Printf("[ERROR] USB camera: VIDIOC_STREAMON failed: %s\n", strerror(errno));
 		return;
 	}
 	usb_camera_streaming_ = 1;
-	LOG_INFO("USB camera: stream started\n");
+	Printf("[INFO] USB camera: stream started\n");
 }
 
 static void usb_camera_stop_stream(void) {
@@ -3746,7 +3747,7 @@ static void usb_camera_stop_stream(void) {
 	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	ioctl(usb_camera_fd_, VIDIOC_STREAMOFF, &type);
 	usb_camera_streaming_ = 0;
-	LOG_INFO("USB camera: stream stopped\n");
+	Printf("[INFO] USB camera: stream stopped\n");
 }
 
 static void usb_camera_deinit(void) {
@@ -3781,7 +3782,7 @@ static int vdec_jpeg_init(void) {
 
 	int ret = RK_MPI_VDEC_CreateChn(VDEC_CHN_ID, &attr);
 	if (ret) {
-		LOG_ERROR("VDEC: CreateChn failed ret=%#x (VDEC may not be supported on this firmware)\n", ret);
+		Printf("[ERROR] VDEC: CreateChn failed ret=%#x (VDEC may not be supported on this firmware)\n", ret);
 		return ret;
 	}
 
@@ -3792,16 +3793,16 @@ static int vdec_jpeg_init(void) {
 	param.stVdecPictureParam.enPixelFormat = RK_FMT_YUV420SP;
 	ret = RK_MPI_VDEC_SetChnParam(VDEC_CHN_ID, &param);
 	if (ret)
-		LOG_WARN("VDEC: SetChnParam ret=%#x\n", ret);
+		Printf("[ERROR] VDEC: SetChnParam ret=%#x\n", ret);
 
 	ret = RK_MPI_VDEC_StartRecvStream(VDEC_CHN_ID);
 	if (ret) {
-		LOG_ERROR("VDEC: StartRecvStream failed ret=%#x\n", ret);
+		Printf("[ERROR] VDEC: StartRecvStream failed ret=%#x\n", ret);
 		RK_MPI_VDEC_DestroyChn(VDEC_CHN_ID);
 		return ret;
 	}
 
-	LOG_INFO("VDEC JPEG decoder initialized (%dx%d)\n", usb_cam_width_, usb_cam_height_);
+	Printf("[INFO] VDEC JPEG decoder initialized (%dx%d)\n", usb_cam_width_, usb_cam_height_);
 	return 0;
 }
 
@@ -3822,7 +3823,7 @@ static int vdec_decode_jpeg(void *jpeg_data, int jpeg_len, VIDEO_FRAME_INFO_S *o
 	MB_BLK mbBlk = NULL;
 	int ret = RK_MPI_SYS_MmzAlloc(&mbBlk, NULL, "vdec_jpeg", jpeg_len);
 	if (ret) {
-		LOG_ERROR("VDEC: MmzAlloc failed\n");
+		Printf("[ERROR] VDEC: MmzAlloc failed\n");
 		return -1;
 	}
 	void *vir = RK_MPI_MB_Handle2VirAddr(mbBlk);
@@ -3833,13 +3834,13 @@ static int vdec_decode_jpeg(void *jpeg_data, int jpeg_len, VIDEO_FRAME_INFO_S *o
 	ret = RK_MPI_VDEC_SendStream(VDEC_CHN_ID, &stream, 1000);
 	RK_MPI_SYS_MmzFree(mbBlk);
 	if (ret) {
-		LOG_ERROR("VDEC: SendStream failed ret=%#x\n", ret);
+		Printf("[ERROR] VDEC: SendStream failed ret=%#x\n", ret);
 		return -1;
 	}
 
 	ret = RK_MPI_VDEC_GetFrame(VDEC_CHN_ID, out_frame, 1000);
 	if (ret) {
-		LOG_ERROR("VDEC: GetFrame failed ret=%#x\n", ret);
+		Printf("[ERROR] VDEC: GetFrame failed ret=%#x\n", ret);
 		return -1;
 	}
 	return 0;
@@ -3865,7 +3866,7 @@ static int usb_venc_create(void) {
 
 	int ret = RK_MPI_VENC_CreateChn(USB_VENC_CHN, &attr);
 	if (ret) {
-		LOG_ERROR("USB VENC: CreateChn failed ret=%#x\n", ret);
+		Printf("[ERROR] USB VENC: CreateChn failed ret=%#x\n", ret);
 		return ret;
 	}
 
@@ -3874,7 +3875,7 @@ static int usb_venc_create(void) {
 	stRecvParam.s32RecvPicNum = -1;
 	RK_MPI_VENC_StartRecvFrame(USB_VENC_CHN, &stRecvParam);
 
-	LOG_INFO("USB VENC channel %d created (H265 %dx%d)\n",
+	Printf("[INFO] USB VENC channel %d created (H265 %dx%d)\n",
 	         USB_VENC_CHN, usb_cam_width_, usb_cam_height_);
 	return 0;
 }
@@ -3889,7 +3890,7 @@ static void usb_venc_destroy(void) {
 static void *usb_camera_encode_thread(void *arg) {
 	(void)arg;
 	prctl(PR_SET_NAME, "UsbCamEnc", 0, 0, 0);
-	LOG_INFO("USB camera thread started (auto-reconnect enabled)\n");
+	Printf("[INFO] USB camera thread started (auto-reconnect enabled)\n");
 
 	VENC_STREAM_S stFrame;
 	stFrame.pstPack = malloc(sizeof(VENC_PACK_S));
@@ -3908,12 +3909,12 @@ static void *usb_camera_encode_thread(void *arg) {
 
 		// === Phase 2: Device discovery + V4L2 init ===
 		if (usb_camera_init() != 0) {
-			LOG_INFO("USB camera: no device found, retrying in 3s...\n");
+			Printf("[WARN] USB camera: no device found, retrying in 3s...\n");
 			for (int i = 0; i < 30 && g_video_run_; i++) {
 				// 检查 TCP 客户端是否断开，避免无效重试
 				int client_connected = (__atomic_load_n(&tcp_video_client_fd[2], __ATOMIC_ACQUIRE) >= 0);
 				if (!client_connected) {
-					LOG_INFO("USB camera: TCP client disconnected, stop retrying\n");
+					Printf("[WARN] USB camera: TCP client disconnected, stop retrying\n");
 					break;  // 退出重试循环，回到外层 continue
 				}
 				usleep(100000);
@@ -3921,7 +3922,7 @@ static void *usb_camera_encode_thread(void *arg) {
 			continue;  // 回到 Phase 1 检查客户端
 		}
 
-		LOG_INFO("USB camera: device ready (%dx%d @%dfps)\n",
+		Printf("[INFO] USB camera: device ready (%dx%d @%dfps)\n",
 		         usb_cam_width_, usb_cam_height_, usb_cam_fps_);
 		consecutive_errors = 0;
 		vdec_created = 0;
@@ -3932,14 +3933,14 @@ static void *usb_camera_encode_thread(void *arg) {
 			client_connected = (__atomic_load_n(&tcp_video_client_fd[2], __ATOMIC_ACQUIRE) >= 0);
 
 			if (!client_connected) {
-				LOG_INFO("USB camera: TCP client disconnected, closing device...\n");
+				Printf("[WARN] USB camera: TCP client disconnected, closing device...\n");
 				break;  // -> Phase 4: full cleanup
 			}
 
 			// TCP client connected: start pipeline if not already running
 			if (!vdec_created) {
 				if (vdec_jpeg_init() != 0) {
-					LOG_ERROR("USB camera: VDEC init failed, retrying...\n");
+					Printf("[ERROR] USB camera: VDEC init failed, retrying...\n");
 					usleep(500000);
 					continue;
 				}
@@ -3947,7 +3948,7 @@ static void *usb_camera_encode_thread(void *arg) {
 			}
 			if (!venc_created) {
 				if (usb_venc_create() != 0) {
-					LOG_ERROR("USB camera: VENC init failed, retrying...\n");
+					Printf("[ERROR] USB camera: VENC init failed, retrying...\n");
 					usleep(500000);
 					continue;
 				}
@@ -3967,7 +3968,7 @@ static void *usb_camera_encode_thread(void *arg) {
 					usleep(10000);
 					continue;
 				}
-				LOG_ERROR("USB camera: DQBUF failed: %s (device disconnected?)\n", strerror(errno));
+				Printf("[ERROR] USB camera: DQBUF failed: %s (device disconnected?)\n", strerror(errno));
 				consecutive_errors++;
 				break;  // -> cleanup and reconnect
 			}
@@ -4006,7 +4007,7 @@ static void *usb_camera_encode_thread(void *arg) {
 
 			// 6. Requeue V4L2 buffer
 			if (ioctl(usb_camera_fd_, VIDIOC_QBUF, &vbuf) < 0) {
-				LOG_ERROR("USB camera: QBUF failed: %s (device disconnected?)\n", strerror(errno));
+				Printf("[ERROR] USB camera: QBUF failed: %s (device disconnected?)\n", strerror(errno));
 				consecutive_errors++;
 				break;  // -> cleanup and reconnect
 			}
@@ -4015,7 +4016,7 @@ static void *usb_camera_encode_thread(void *arg) {
 		}
 
 		// === Phase 4: Cleanup after TCP disconnect or error ===
-		LOG_INFO("USB camera: cleaning up (errors=%d)...\n", consecutive_errors);
+		Printf("[WARN] USB camera: cleaning up (errors=%d)...\n", consecutive_errors);
 		if (venc_created) {
 			usb_venc_destroy();
 			venc_created = 0;
@@ -4028,11 +4029,11 @@ static void *usb_camera_encode_thread(void *arg) {
 
 		// Wait before re-detecting
 		if (g_video_run_) {
-			LOG_INFO("USB camera: waiting for TCP client...\n");
+			Printf("[INFO] USB camera: waiting for TCP client...\n");
 			for (int i = 0; i < 100 && g_video_run_; i++) {
 				// Check if TCP client reconnected during wait
 				if (__atomic_load_n(&tcp_video_client_fd[2], __ATOMIC_ACQUIRE) >= 0) {
-					LOG_INFO("USB camera: TCP client reconnected, reopening device...\n");
+					Printf("[INFO] USB camera: TCP client reconnected, reopening device...\n");
 					break;
 				}
 				usleep(100000);
@@ -4044,13 +4045,14 @@ static void *usb_camera_encode_thread(void *arg) {
 	if (stFrame.pstPack)
 		free(stFrame.pstPack);
 
-	LOG_INFO("USB camera thread exited\n");
+	Printf("[INFO] USB camera thread exited\n");
 	return NULL;
 }
 
 // ========== End USB Camera Module ==========
 
 int rk_video_init() {
+	logInit(0);
 	LOG_DEBUG("begin\n");
 	int ret = 0;
 	enable_ivs = rk_param_get_int("video.source:enable_ivs", 1);
@@ -4105,7 +4107,7 @@ int rk_video_init() {
 	// USB Camera (optional, auto-reconnect thread handles device discovery)
 	if (rk_param_get_int("video.usb:enable", 1)) {
 		pthread_create(&usb_camera_thread_, NULL, usb_camera_encode_thread, NULL);
-		LOG_INFO("USB camera auto-reconnect thread created\n");
+		Printf("[INFO] USB camera auto-reconnect thread created\n");
 	}
 
 	LOG_DEBUG("over\n");
@@ -4114,6 +4116,7 @@ int rk_video_init() {
 }
 
 int rk_video_deinit() {
+	logDeinit();
 	LOG_DEBUG("%s\n", __func__);
 	g_video_run_ = 0;
 	int ret = 0;
