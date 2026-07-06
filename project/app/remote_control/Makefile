@@ -19,7 +19,7 @@ STRIP := $(RK_APP_CROSS)-strip
 CFLAGS += -Wall -O2
 LDFLAGS += -lpthread -lm
 
-SRCS := source/remote_control.c source/ml307c.c source/audio.c
+SRCS := source/remote_control.c source/ml307c.c source/audio.c source/log.c
 
 # ALSA library (libasound)
 RK_BUILDROOT_SYSROOT := $(shell ls -d $(CURDIR)/../../../sysdrv/source/buildroot/buildroot-*/output/host/arm-buildroot-linux-uclibcgnueabihf/sysroot 2>/dev/null | head -1)

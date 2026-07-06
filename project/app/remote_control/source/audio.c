@@ -28,6 +28,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <alsa/asoundlib.h>
+#include "log.h"
 
 /* ======================== 配置参数 ======================== */
 
@@ -51,9 +52,9 @@
 
 /* ======================== 日志宏 ======================== */
 
-#define LOG_INFO(fmt, ...)  printf("[Audio][I] " fmt "\n", ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  printf("[Audio][W] " fmt "\n", ##__VA_ARGS__)
-#define LOG_ERR(fmt, ...)   printf("[Audio][E] " fmt "\n", ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  Printf("[Audio][I] " fmt "\n", ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  Printf("[Audio][W] " fmt "\n", ##__VA_ARGS__)
+#define LOG_ERR(fmt, ...)   Printf("[Audio][E] " fmt "\n", ##__VA_ARGS__)
 
 /* ======================== GPIO 控制 ======================== */
 
@@ -399,9 +400,13 @@ static void *audio_recv_thread(void *arg) {
     /* 正常播放循环 */
     while (g_audio_running && g_client_fd >= 0) {
         /* 检查 ALSA 缓冲区延迟，如果已播放完则清除标志 */
-        snd_pcm_sframes_t delay = 0;
-        if (g_pcm_playback && snd_pcm_delay(g_pcm_playback, &delay) == 0) {
-            if (delay == 0) {
+        if (g_is_playing && g_pcm_playback) {
+            snd_pcm_sframes_t delay = 0;
+            int ret = snd_pcm_delay(g_pcm_playback, &delay);
+            if (ret < 0) {
+                /* snd_pcm_delay 返回错误（如 underrun 后 -EPIPE），播放已停止 */
+                g_is_playing = 0;
+            } else if (delay <= 0) {
                 g_is_playing = 0;  /* 缓冲区已空，播放结束 */
             }
         }
@@ -584,9 +589,9 @@ int audio_init(void) {
     struct sockaddr_in server_addr;
     int opt = 1;
 
-    printf("[Audio] Initializing audio module (ALSA)...\n");
-    printf("[Audio] Format: %dHz/%dch/%dbit\n", AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BIT_WIDTH);
-    printf("[Audio] TCP port: %d\n", TCP_AUDIO_PORT);
+    Printf("[Audio] Initializing audio module (ALSA)...\n");
+    Printf("[Audio] Format: %dHz/%dch/%dbit\n", AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BIT_WIDTH);
+    Printf("[Audio] TCP port: %d\n", TCP_AUDIO_PORT);
 
     /* 初始化 ALSA 采集 */
     if (audio_capture_init() != 0) {

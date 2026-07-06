@@ -25,6 +25,7 @@
 #include <sys/time.h>
 
 #include "ml307c.h"
+#include "log.h"
 
 /* ======================== Configuration ======================== */
 
@@ -103,19 +104,19 @@ static int wait_for_urc(volatile int *flag, const char *urc_prefix, int timeout_
     int64_t deadline = now_ms() + timeout_ms;
     
     if (urc_prefix)
-        printf("[ML307C] waiting for URC: %s...\n", urc_prefix);
+        Printf("[ML307C] waiting for URC: %s...\n", urc_prefix);
     
     while (now_ms() < deadline && g_worker_running) {
         if (*flag) {
             if (urc_prefix)
-                printf("[ML307C] URC received: %s\n", urc_prefix);
+                Printf("[ML307C] URC received: %s\n", urc_prefix);
             return 0;  /* URC received */
         }
         ml307c_sleep(200);  /* Check every 200ms */
     }
     
     if (urc_prefix)
-        fprintf(stderr, "[ML307C] URC timeout: %s\n", urc_prefix);
+        Printf("[ML307C] URC timeout: %s\n", urc_prefix);
     return -1;  /* Timeout or interrupted */
 }
 
@@ -125,7 +126,7 @@ static int serial_open(const char *dev)
 {
     int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) {
-        fprintf(stderr, "[ML307C] open %s: %s\n", dev, strerror(errno));
+        Printf("[ML307C] open %s: %s\n", dev, strerror(errno));
         return -1;
     }
 
@@ -166,7 +167,7 @@ static int serial_write(int fd, const char *data, int len)
         ssize_t n = write(fd, data + total, len - total);
         if (n < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "[ML307C] write: %s\n", strerror(errno));
+            Printf("[ML307C] write: %s\n", strerror(errno));
             return -1;
         }
         total += n;
@@ -230,7 +231,7 @@ static void process_line(const char *line)
  */
 void ml307c_parse_rmc(const char *sentence)
 {
-    // printf("[ML307C] RMC: %s\n", sentence);
+    // Printf("[ML307C] RMC: %s\n", sentence);
 
     char buf[256];
     strncpy(buf, sentence, sizeof(buf) - 1);
@@ -283,7 +284,7 @@ void ml307c_parse_rmc(const char *sentence)
     g_gps.update_ms = now_ms();
     pthread_mutex_unlock(&g_gps_mtx);
 
-    // printf("[ML307C] GPS: lat=%.6f lon=%.6f spd=%.1f km/h\n",
+    // Printf("[ML307C] GPS: lat=%.6f lon=%.6f spd=%.1f km/h\n",
     //        lat, lon, spd_kmh);
 }
 
@@ -306,11 +307,11 @@ static int at_send_worker(const char *cmd, int timeout_ms)
 
     int cmd_len = strlen(cmd);
     /* Print command without trailing \r\n */
-    // printf("[ML307C] TX: %s", cmd);
+    // Printf("[ML307C] TX: %s", cmd);
     // if (cmd_len >= 2 && cmd[cmd_len-2] == '\r' && cmd[cmd_len-1] == '\n')
-    //     printf("\n");
+    //     Printf("\n");
     // else
-    //     printf("\n");
+    //     Printf("\n");
     
     serial_write(g_at_fd, cmd, cmd_len);
 
@@ -327,7 +328,7 @@ static int at_send_worker(const char *cmd, int timeout_ms)
                 continue;
             }
             if (errno == EINTR) continue;
-            fprintf(stderr, "[ML307C] read error: %s\n", strerror(errno));
+            Printf("[ML307C] read error: %s\n", strerror(errno));
             return -1;
         }
         if (n == 0) {
@@ -355,12 +356,12 @@ static int at_send_worker(const char *cmd, int timeout_ms)
 
     int len = g_at_resp_len;
     if (!g_worker_running) {
-        printf("[ML307C] AT interrupted by shutdown\n");
+        Printf("[ML307C] AT interrupted by shutdown\n");
         return -1;
     } else if (g_at_resp_ready) {
-        // printf("[ML307C] RX: %s", g_at_resp);
+        // Printf("[ML307C] RX: %s", g_at_resp);
     } else {
-        fprintf(stderr, "[ML307C] timeout: %.*s\n", cmd_len - 2, cmd);
+        Printf("[ML307C] timeout: %.*s\n", cmd_len - 2, cmd);
     }
 
     return g_at_resp_ready ? len : -1;
@@ -387,12 +388,12 @@ static int wait_module_ready(void)
     for (int i = 0; i < 10 && g_worker_running; i++) {
         if (at_ok_worker("AT\r\n", 2000) == 0)
             return 0;
-        printf("[ML307C] waiting for module... (%d/10)\n", i + 1);
+        Printf("[ML307C] waiting for module... (%d/10)\n", i + 1);
         if (ml307c_sleep(2000) < 0) return -1;
     }
     if (!g_worker_running)
         return -1;
-    fprintf(stderr, "[ML307C] module not responding\n");
+    Printf("[ML307C] module not responding\n");
     return -1;
 }
 
@@ -402,13 +403,13 @@ static int wait_network(int timeout_sec)
     while (now_ms() < deadline && g_worker_running) {
         int n = at_send_worker("AT+COPS?\r\n", AT_TIMEOUT_MS);
         if (n > 0 && strstr(g_at_resp, "+COPS: 0")) {
-            printf("[ML307C] network registered\n");
+            Printf("[ML307C] network registered\n");
             return 0;
         }
-        printf("[ML307C] waiting for network...\n");
+        Printf("[ML307C] waiting for network...\n");
         if (ml307c_sleep(3000) < 0) return -1;
     }
-    fprintf(stderr, "[ML307C] network registration timeout\n");
+    Printf("[ML307C] network registration timeout\n");
     return -1;
 }
 
@@ -416,14 +417,14 @@ static int get_imei(void)
 {
     int n = at_send_worker("AT+GSN=1\r\n", AT_TIMEOUT_MS);
     if (n < 0 || !resp_has_ok(g_at_resp)) {
-        fprintf(stderr, "[ML307C] get IMEI failed\n");
+        Printf("[ML307C] get IMEI failed\n");
         return -1;
     }
 
     /* Parse +GSN: <imei> */
     char *p = strstr(g_at_resp, "+GSN:");
     if (!p) {
-        fprintf(stderr, "[ML307C] IMEI not found in response\n");
+        Printf("[ML307C] IMEI not found in response\n");
         return -1;
     }
     p += 5;  /* skip "+GSN:" */
@@ -436,7 +437,7 @@ static int get_imei(void)
     imei[i] = '\0';
 
     if (i == 0) {
-        fprintf(stderr, "[ML307C] IMEI is empty\n");
+        Printf("[ML307C] IMEI is empty\n");
         return -1;
     }
 
@@ -445,42 +446,42 @@ static int get_imei(void)
     g_imei[sizeof(g_imei) - 1] = '\0';
     pthread_mutex_unlock(&g_imei_mtx);
 
-    printf("[ML307C] IMEI: %s\n", imei);
+    Printf("[ML307C] IMEI: %s\n", imei);
     return 0;
 }
 
 static int rndis_dial(void)
 {
     if (at_ok_worker("AT+MDIALUPCFG=\"mode\",0\r\n", AT_TIMEOUT_MS) < 0) {
-        fprintf(stderr, "[ML307C] set RNDIS mode failed\n");
+        Printf("[ML307C] set RNDIS mode failed\n");
         return -1;
     }
 
     int n = at_send_worker("AT+MDIALUP=1,1\r\n", AT_DIAL_TIMEOUT_MS);
     if (n < 0 || !resp_has_ok(g_at_resp)) {
-        fprintf(stderr, "[ML307C] dial failed\n");
+        Printf("[ML307C] dial failed\n");
         return -1;
     }
 
     if (strstr(g_at_resp, "+MDIALUP:"))
-        printf("[ML307C] RNDIS dial success\n");
+        Printf("[ML307C] RNDIS dial success\n");
     else
-        printf("[ML307C] dial OK, awaiting IP...\n");
+        Printf("[ML307C] dial OK, awaiting IP...\n");
 
     /* Skip udhcpc if interface already has an IP */
     if (system("ifconfig " RNDIS_IFACE " | grep -q 'inet addr' 2>/dev/null") == 0) {
-        printf("[ML307C] %s already has IP, skip udhcpc\n", RNDIS_IFACE);
+        Printf("[ML307C] %s already has IP, skip udhcpc\n", RNDIS_IFACE);
         return 0;
     }
 
-    printf("[ML307C] running udhcpc on %s...\n", RNDIS_IFACE);
+    Printf("[ML307C] running udhcpc on %s...\n", RNDIS_IFACE);
     /* Kill existing udhcpc processes to avoid duplicates */
     system("killall udhcpc 2>/dev/null");
     ml307c_sleep(500);  /* Wait for old processes to exit */
 
     int ret = system("udhcpc -i " RNDIS_IFACE " -b -t 10 -T 3 2>/dev/null");
     if (ret != 0)
-        fprintf(stderr, "[ML307C] DHCP failed (non-fatal)\n");
+        Printf("[ML307C] DHCP failed (non-fatal)\n");
 
     return 0;
 }
@@ -491,79 +492,79 @@ static int gnss_configure(void)
 {
     /* Set NMEA output port to AT port (0 = AT port) */
     if (at_ok_worker("AT+MGNSSCFG=\"nmea/port\",0\r\n", AT_TIMEOUT_MS) < 0)
-        fprintf(stderr, "[ML307C] set nmea/port failed\n");
+        Printf("[ML307C] set nmea/port failed\n");
 
     /* Enable only RMC (bit3 = 0x08 = 8) to reduce data volume */
     if (at_ok_worker("AT+MGNSSCFG=\"nmea/mask\",8\r\n", AT_TIMEOUT_MS) < 0) {
-        fprintf(stderr, "[ML307C] set nmea/mask failed\n");
+        Printf("[ML307C] set nmea/mask failed\n");
         return -1;
     }
 
     /* NMEA output cycle: 2 seconds */
     if (at_ok_worker("AT+MGNSSCFG=\"nmea/cycle\",2\r\n", AT_TIMEOUT_MS) < 0)
-        fprintf(stderr, "[ML307C] set nmea/cycle failed\n");
+        Printf("[ML307C] set nmea/cycle failed\n");
 
     /* Configure AGNSS server URL */
     if (at_ok_worker("AT+MGNSSCFG=\"agnss/url\",\"cmiot-api1.rx-networks.cn:80\"\r\n", AT_TIMEOUT_MS) < 0)
-        fprintf(stderr, "[ML307C] set AGNSS URL failed (non-fatal)\n");
+        Printf("[ML307C] set AGNSS URL failed (non-fatal)\n");
 
     /* Enable auto-report location info */
     if (at_ok_worker("AT+MGNSSLOC=1\r\n", AT_TIMEOUT_MS) < 0)
-        fprintf(stderr, "[ML307C] set MGNSSLOC failed\n");
+        Printf("[ML307C] set MGNSSLOC failed\n");
 
     /* Request AGNSS data update (async - OK means accepted, URC comes later) */
-    printf("[ML307C] requesting AGNSS data update...\n");
+    Printf("[ML307C] requesting AGNSS data update...\n");
     if (at_ok_worker("AT+MAGNSSDATA\r\n", AT_TIMEOUT_MS) < 0) {
-        fprintf(stderr, "[ML307C] AGNSS data request failed (non-fatal)\n");
+        Printf("[ML307C] AGNSS data request failed (non-fatal)\n");
     } else {
         /* Wait for URC: +MAGNSSDATA: 1 */
         g_agnss_data_ready = 0;  /* Reset flag */
         
         if (wait_for_urc(&g_agnss_data_ready, "+MAGNSSDATA: 1", 5000) == 0)
-            printf("[ML307C] AGNSS data updated successfully\n");
+            Printf("[ML307C] AGNSS data updated successfully\n");
         else
-            fprintf(stderr, "[ML307C] AGNSS data download timeout (non-fatal)\n");
+            Printf("[ML307C] AGNSS data download timeout (non-fatal)\n");
     }
 
     /* Enable AGNSS mode: check if already enabled first */
-    printf("[ML307C] checking AGNSS status...\n");
+    Printf("[ML307C] checking AGNSS status...\n");
     int n = at_send_worker("AT+MAGNSSEN?\r\n", AT_TIMEOUT_MS);
     int agnss_enabled = 0;
     
     if (n > 0 && strstr(g_at_resp, "+MAGNSSEN: 1")) {
         agnss_enabled = 1;
-        printf("[ML307C] AGNSS already enabled, skipping\n");
+        Printf("[ML307C] AGNSS already enabled, skipping\n");
     } else {
-        printf("[ML307C] enabling AGNSS...\n");
+        Printf("[ML307C] enabling AGNSS...\n");
         if (at_ok_worker("AT+MAGNSSEN=1\r\n", AT_TIMEOUT_MS) < 0) {
-            fprintf(stderr, "[ML307C] enable AGNSS failed (non-fatal)\n");
+            Printf("[ML307C] enable AGNSS failed (non-fatal)\n");
         } else {
-            printf("[ML307C] AGNSS enabled\n");
+            Printf("[ML307C] AGNSS enabled\n");
         }
     }
     
     (void)agnss_enabled;
 
     /* Start GNSS: check if already running first */
-    printf("[ML307C] checking GNSS status...\n");
+    Printf("[ML307C] checking GNSS status...\n");
     n = at_send_worker("AT+MGNSS?\r\n", AT_TIMEOUT_MS);
     int gnss_running = 0;
     
     if (n > 0 && strstr(g_at_resp, "+MGNSS: 1")) {
         gnss_running = 1;
-        printf("[ML307C] GNSS already running, skipping start\n");
+        Printf("[ML307C] GNSS already running, skipping start\n");
     } else {
-        printf("[ML307C] starting GNSS...\n");
+        Printf("[ML307C] starting GNSS...\n");
         if (at_ok_worker("AT+MGNSS=1\r\n", AT_TIMEOUT_MS) < 0) {
-            fprintf(stderr, "[ML307C] start GNSS failed\n");
+            Printf("[ML307C] start GNSS failed\n");
             return -1;
         }
-        printf("[ML307C] GNSS started\n");
+        Printf("[ML307C] GNSS started\n");
     }
     
     (void)gnss_running;  /* Used for status logging */
 
-    printf("[ML307C] GNSS configured: AGNSS on, GNRMC only, cycle=2s\n");
+    Printf("[ML307C] GNSS configured: AGNSS on, GNRMC only, cycle=2s\n");
     return 0;
 }
 
@@ -575,37 +576,37 @@ static int gnss_configure(void)
  */
 static int ml307c_do_init(void)
 {
-    printf("[ML307C] initializing module...\n");
+    Printf("[ML307C] initializing module...\n");
 
     /* Wait for module ready */
     if (wait_module_ready() < 0) {
-        fprintf(stderr, "[ML307C] module init failed\n");
+        Printf("[ML307C] module init failed\n");
         return -1;
     }
 
     /* Disable echo */
     if (at_ok_worker("ATE0\r\n", AT_TIMEOUT_MS) < 0)
-        fprintf(stderr, "[ML307C] ATE0 failed (non-fatal)\n");
+        Printf("[ML307C] ATE0 failed (non-fatal)\n");
 
     /* Wait for network */
     if (wait_network(60) < 0)
-        fprintf(stderr, "[ML307C] no network, continuing anyway\n");
+        Printf("[ML307C] no network, continuing anyway\n");
 
     /* Get IMEI */
     if (get_imei() < 0)
-        fprintf(stderr, "[ML307C] IMEI fetch failed (non-fatal)\n");
+        Printf("[ML307C] IMEI fetch failed (non-fatal)\n");
 
     /* RNDIS dial-up */
     if (rndis_dial() < 0)
-        fprintf(stderr, "[ML307C] RNDIS dial failed\n");
+        Printf("[ML307C] RNDIS dial failed\n");
 
     /* Configure GNSS */
     if (gnss_configure() < 0) {
-        fprintf(stderr, "[ML307C] GNSS config failed\n");
+        Printf("[ML307C] GNSS config failed\n");
         return -1;
     }
 
-    printf("[ML307C] module initialized successfully\n");
+    Printf("[ML307C] module initialized successfully\n");
     return 0;
 }
 
@@ -624,17 +625,17 @@ static void *worker_thread(void *arg)
     int initialized = 0;  /* Track if module is initialized */
     int64_t last_signal_ms = 0;  /* Track last signal strength query */
 
-    printf("[ML307C] worker thread started\n");
+    Printf("[ML307C] worker thread started\n");
 
     while (g_worker_running) {
         /* ---- Phase 1: Wait for device to appear ---- */
         if (access(ML307C_AT_PORT, F_OK) != 0) {
             if (initialized) {
-                fprintf(stderr, "[ML307C] device disconnected\n");
+                Printf("[ML307C] device disconnected\n");
                 initialized = 0;
             }
             
-            printf("[ML307C] waiting for %s...\n", ML307C_AT_PORT);
+            Printf("[ML307C] waiting for %s...\n", ML307C_AT_PORT);
             /* Poll every 100ms for up to 10s */
             for (int i = 0; i < 100 && g_worker_running; i++) {
                 if (access(ML307C_AT_PORT, F_OK) == 0)
@@ -648,11 +649,11 @@ static void *worker_thread(void *arg)
         if (g_at_fd < 0) {
             g_at_fd = serial_open(ML307C_AT_PORT);
             if (g_at_fd < 0) {
-                fprintf(stderr, "[ML307C] failed to open port, retrying...\n");
+                Printf("[ML307C] failed to open port, retrying...\n");
                 ml307c_sleep(2000);
                 continue;
             }
-            printf("[ML307C] AT port %s opened\n", ML307C_AT_PORT);
+            Printf("[ML307C] AT port %s opened\n", ML307C_AT_PORT);
         }
 
         /* ---- Phase 3: Initialize module (if not already) ---- */
@@ -660,7 +661,7 @@ static void *worker_thread(void *arg)
             if (ml307c_do_init() == 0) {
                 initialized = 1;
             } else {
-                fprintf(stderr, "[ML307C] init failed, will retry...\n");
+                Printf("[ML307C] init failed, will retry...\n");
                 /* Close and retry */
                 if (g_at_fd >= 0) {
                     close(g_at_fd);
@@ -703,7 +704,7 @@ static void *worker_thread(void *arg)
                         g_signal_update_ms = now;
                         pthread_mutex_unlock(&g_signal_mtx);
                         
-                        // printf("[ML307C] Signal: RSSI=%d, %d dBm\n", rssi, dbm);
+                        // Printf("[ML307C] Signal: RSSI=%d, %d dBm\n", rssi, dbm);
                     }
                 }
             }
@@ -730,7 +731,7 @@ static void *worker_thread(void *arg)
             if (errno == EINTR) continue;
             
             /* Read error - device likely disconnected */
-            fprintf(stderr, "[ML307C] read error: %s, closing port\n", strerror(errno));
+            Printf("[ML307C] read error: %s, closing port\n", strerror(errno));
             if (g_at_fd >= 0) {
                 close(g_at_fd);
                 g_at_fd = -1;
@@ -759,7 +760,7 @@ static void *worker_thread(void *arg)
         }
     }
 
-    printf("[ML307C] worker thread shutting down\n");
+    Printf("[ML307C] worker thread shutting down\n");
     
     /* Cleanup */
     if (g_at_fd >= 0) {
@@ -767,7 +768,7 @@ static void *worker_thread(void *arg)
         g_at_fd = -1;
     }
     
-    printf("[ML307C] worker thread exited\n");
+    Printf("[ML307C] worker thread exited\n");
     return NULL;
 }
 
@@ -784,7 +785,7 @@ int ml307c_init(void)
     /* Start worker thread - it will handle everything */
     g_worker_running = 1;
     if (pthread_create(&g_worker_tid, NULL, worker_thread, NULL) != 0) {
-        fprintf(stderr, "[ML307C] create worker thread failed\n");
+        Printf("[ML307C] create worker thread failed\n");
         return -1;
     }
 
@@ -805,7 +806,7 @@ void ml307c_deinit(void)
     }
 
     pthread_join(g_worker_tid, NULL);
-    printf("[ML307C] deinitialized\n");
+    Printf("[ML307C] deinitialized\n");
 }
 
 int ml307c_get_gps(ml307c_gps_data_t *data)

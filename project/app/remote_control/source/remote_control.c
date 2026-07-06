@@ -15,7 +15,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/socket.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -23,6 +23,7 @@
 #include <pthread.h>
 #include "ml307c.h"
 #include "audio.h"
+#include "log.h"
 
 
 /* ======================== Configuration ======================== */
@@ -39,7 +40,7 @@
 /* 电机PWM参数 (内置电调模式) */
 #define MOTOR_PWM_FREQ_HZ      1000    /* Motor PWM frequency */
 #define MOTOR_PWM_PERIOD_NS    (1000000000LL / MOTOR_PWM_FREQ_HZ)   /* 1000000 ns = 1ms */
-#define MOTOR_MIN_DUTY         50      /* 电机最小启动占空比 */
+#define MOTOR_MIN_DUTY         80      /* 电机最小启动占空比 */
 #define MOTOR_DEAD_ZONE        10      /* 电机死区范围 */
 
 /* 灯光PWM参数 (内置MOS管控制模式) */
@@ -196,7 +197,7 @@ static int write_sysfs(const char *path, const char *value)
 {
     int fd = open(path, O_WRONLY);
     if (fd < 0) {
-        fprintf(stderr, "[SYS] open %s: %s\n", path, strerror(errno));
+        Printf("[SYS] open %s: %s\n", path, strerror(errno));
         return -1;
     }
     ssize_t n = write(fd, value, strlen(value));
@@ -252,7 +253,7 @@ static int pwm_open_duty(int chip)
     snprintf(path, sizeof(path), "/sys/class/pwm/pwmchip%d/pwm0/duty_cycle", chip);
     int fd = open(path, O_WRONLY);
     if (fd < 0)
-        fprintf(stderr, "[PWM] open %s: %s\n", path, strerror(errno));
+        Printf("[PWM] open %s: %s\n", path, strerror(errno));
     return fd;
 }
 
@@ -298,14 +299,14 @@ static int pwm_init_all(void)
         { 0,  IDX_CH4, ch4_period },  /* PWM0  - CH4 备用 */
     };
     
-    printf("[PWM] motor mode: %s, light mode: %s\n",
+    Printf("[PWM] motor mode: %s, light mode: %s\n",
            g_motor_mode == MODE_MOTOR_INTERNAL ? "internal ESC" : "external servo",
            g_light_mode == MODE_LIGHT_INTERNAL ? "internal MOS" : "external servo");
 
     /* 初始化 CH1-CH4 */
     for (int i = 0; i < PWM_COUNT; i++) {
         if (pwm_init_one(cfg[i].chip, cfg[i].period) < 0) {
-            fprintf(stderr, "[PWM] init chip%d failed\n", cfg[i].chip);
+            Printf("[PWM] init chip%d failed\n", cfg[i].chip);
             return -1;
         }
         g_pwm_fd[cfg[i].idx] = pwm_open_duty(cfg[i].chip);
@@ -316,15 +317,15 @@ static int pwm_init_all(void)
     /* 内置电调模式: 初始化 PWM11 用于电机反转 */
     if (g_motor_mode == MODE_MOTOR_INTERNAL) {
         if (pwm_init_one(11, MOTOR_PWM_PERIOD_NS) < 0) {
-            fprintf(stderr, "[PWM] init PWM11 (motor reverse) failed\n");
+            Printf("[PWM] init PWM11 (motor reverse) failed\n");
             return -1;
         }
         g_pwm11_fd = pwm_open_duty(11);
         if (g_pwm11_fd < 0) {
-            fprintf(stderr, "[PWM] open PWM11 duty_cycle failed\n");
+            Printf("[PWM] open PWM11 duty_cycle failed\n");
             return -1;
         }
-        printf("[PWM] PWM11 initialized for motor reverse\n");
+        Printf("[PWM] PWM11 initialized for motor reverse\n");
     } else {
         /* 外部电调模式: 关闭 PWM11 */
         if (g_pwm11_fd >= 0) {
@@ -333,7 +334,7 @@ static int pwm_init_all(void)
         }
     }
     
-    printf("[PWM] initialized successfully\n");
+    Printf("[PWM] initialized successfully\n");
     return 0;
 }
 
@@ -401,15 +402,17 @@ static void apply_motor(uint16_t throttle)
         if (new_dir == 1) {
             /* Forward: PWM11 outputs PWM, PWM10(CH1) fixed low */
             duty = throttle - 512;
-            /* 平滑启动补偿: 将11-512映射到MOTOR_MIN_DUTY-512 */
-            duty = MOTOR_MIN_DUTY + duty * (512 - MOTOR_MIN_DUTY) / 512;
+            /* 非线性曲线: 前段缓慢上升，后端快速上升 (二次方) */
+            /* duty ∈ [0,512] → out ∈ [MOTOR_MIN_DUTY, 512] */
+            duty = MOTOR_MIN_DUTY + (int64_t)(512 - MOTOR_MIN_DUTY) * duty * duty / (512 * 512);
             pwm_set_duty(g_pwm_fd[IDX_CH1], 0);
             pwm_set_duty(g_pwm11_fd, (int64_t)duty * MOTOR_PWM_PERIOD_NS / 512);
         } else if (new_dir == -1) {
             /* Backward: PWM10(CH1) outputs PWM, PWM11 fixed low */
             duty = 512 - throttle;
-            /* 平滑启动补偿: 将11-512映射到MOTOR_MIN_DUTY-512 */
-            duty = MOTOR_MIN_DUTY + duty * (512 - MOTOR_MIN_DUTY) / 512;
+            /* 非线性曲线: 前段缓慢上升，后端快速上升 (二次方) */
+            /* duty ∈ [0,512] → out ∈ [MOTOR_MIN_DUTY, 512] */
+            duty = MOTOR_MIN_DUTY + (int64_t)(512 - MOTOR_MIN_DUTY) * duty * duty / (512 * 512);
             pwm_set_duty(g_pwm_fd[IDX_CH1], (int64_t)duty * MOTOR_PWM_PERIOD_NS / 512);
             pwm_set_duty(g_pwm11_fd, 0);
         } else {
@@ -428,8 +431,15 @@ static void apply_motor(uint16_t throttle)
 static void apply_steering(uint16_t steering)
 {
     /* PWM9 始终作为 CH2 转向舵机信号 (不受电机模式影响) */
+    /* 二次方曲线: 中位附近缓慢变化，两端快速变化 */
     /* 0 → 2500us, 512 → 1500us, 1024 → 500us */
-    int64_t pulse_us = SERVO_MAX_US - (int64_t)steering * (SERVO_MAX_US - SERVO_MIN_US) / 1024;
+    int offset = steering - 512;
+    int sign = (offset >= 0) ? 1 : -1;
+    int abs_offset = sign * offset;  /* |offset|, 范围 [0, 512] */
+    /* 二次方映射: abs_offset² / 512² 归一化到 [0,1] */
+    int64_t delta_us = (int64_t)(SERVO_MAX_US - SERVO_MIN_US) / 2
+                       * abs_offset * abs_offset / (512 * 512);
+    int64_t pulse_us = 1500 - sign * delta_us;
     pwm_set_duty(g_pwm_fd[IDX_CH2], pulse_us * 1000);  /* us → ns */
 }
 
@@ -544,7 +554,7 @@ static int parse_control(const uint8_t *buf, int len, uint32_t *tm_ptr)
             static int64_t last_print_ms = 0;
             int64_t now = time_ms();
             if (now - last_print_ms >= 2000) {
-                // printf("[CTRL] throttle=%d, steering=%d, light=%d\n",
+                // Printf("[CTRL] throttle=%d, steering=%d, light=%d\n",
                 //        g_throttle, g_steering, g_light);
                 last_print_ms = now;
             }
@@ -572,14 +582,14 @@ static int parse_config(const uint8_t *buf, int len)
 
         /* Valid config frame - update modes */
         if (pkt->motor_mode > 1 || pkt->light_mode > 1) {
-            fprintf(stderr, "[CONFIG] invalid mode: motor=%d, light=%d\n", 
+            Printf("[CONFIG] invalid mode: motor=%d, light=%d\n", 
                     pkt->motor_mode, pkt->light_mode);
             return i + sizeof(ConfigPacket);
         }
 
         /* Check if modes changed */
         if (pkt->motor_mode != g_motor_mode || pkt->light_mode != g_light_mode) {
-            printf("[CONFIG] mode change: motor %d->%d, light %d->%d\n",
+            Printf("[CONFIG] mode change: motor %d->%d, light %d->%d\n",
                    g_motor_mode, pkt->motor_mode,
                    g_light_mode, pkt->light_mode);
             
@@ -590,9 +600,9 @@ static int parse_config(const uint8_t *buf, int len)
             /* Reinitialize PWM with new modes */
             pwm_deinit();
             if (pwm_init_all() < 0) {
-                fprintf(stderr, "[CONFIG] PWM reinit failed!\n");
+                Printf("[CONFIG] PWM reinit failed!\n");
             } else {
-                printf("[CONFIG] PWM reinitialized successfully\n");
+                Printf("[CONFIG] PWM reinitialized successfully\n");
             }
             
             /* Reset to defaults after mode change */
@@ -609,7 +619,7 @@ static int parse_config(const uint8_t *buf, int len)
 static int tcp_init(void)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket"); return -1; }
+    if (fd < 0) { Printf("socket: %s\n", strerror(errno)); return -1; }
 
     /* Allow socket reuse for quick restart */
     int opt = 1;
@@ -632,21 +642,21 @@ static int tcp_init(void)
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "[TCP] port %d already in use. Kill old process: killall -9 remote_control\n", TCP_PORT);
-        perror("bind"); close(fd); return -1;
+        Printf("[TCP] port %d already in use. Kill old process: killall -9 remote_control\n", TCP_PORT);
+        Printf("bind: %s\n", strerror(errno)); close(fd); return -1;
     }
     if (listen(fd, 1) < 0) {
-        perror("listen"); close(fd); return -1;
+        Printf("listen: %s\n", strerror(errno)); close(fd); return -1;
     }
 
-    printf("[TCP] listening on port %d\n", TCP_PORT);
+    Printf("[TCP] listening on port %d\n", TCP_PORT);
     return fd;
 }
 
 static int udp_init(void)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) { perror("UDP socket"); return -1; }
+    if (fd < 0) { Printf("UDP socket: %s\n", strerror(errno)); return -1; }
 
     /* Allow socket reuse */
     int opt = 1;
@@ -663,11 +673,11 @@ static int udp_init(void)
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "[UDP] port %d bind failed\n", TCP_PORT);
-        perror("bind"); close(fd); return -1;
+        Printf("[UDP] port %d bind failed\n", TCP_PORT);
+        Printf("bind: %s\n", strerror(errno)); close(fd); return -1;
     }
 
-    printf("[UDP] listening on port %d\n", TCP_PORT);
+    Printf("[UDP] listening on port %d\n", TCP_PORT);
     return fd;
 }
 
@@ -676,7 +686,7 @@ static void accept_client(void)
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
     int fd = accept(g_server_fd, (struct sockaddr *)&addr, &addrlen);
-    if (fd < 0) { perror("accept"); return; }
+    if (fd < 0) { Printf("accept: %s\n", strerror(errno)); return; }
 
     /* Disable Nagle algorithm for client socket */
     int opt = 1;
@@ -689,11 +699,11 @@ static void accept_client(void)
     /* Kick old connection */
     if (g_client_fd >= 0) {
         close(g_client_fd);
-        printf("[TCP] old connection closed\n");
+        Printf("[TCP] old connection closed\n");
     }
     g_client_fd = fd;
     g_last_recv_ms = time_ms();
-    printf("[TCP] client connected: %s:%d\n",
+    Printf("[TCP] client connected: %s:%d\n",
            inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 }
 
@@ -702,7 +712,7 @@ static void disconnect_client(void)
     if (g_client_fd >= 0) {
         close(g_client_fd);
         g_client_fd = -1;
-        printf("[TCP] client disconnected\n");
+        Printf("[TCP] client disconnected\n");
     }
     set_defaults();
 }
@@ -711,7 +721,7 @@ static void disconnect_udp_client(void)
 {
     if (g_udp_client_connected) {
         g_udp_client_connected = 0;
-        printf("[UDP] client disconnected\n");
+        Printf("[UDP] client disconnected\n");
     }
     set_defaults();
 }
@@ -729,7 +739,7 @@ static int parse_proxy_config(proxy_config_t *cfg)
 {
     FILE *fp = fopen(PROXY_CONF_PATH, "r");
     if (!fp) {
-        fprintf(stderr, "[PROXY] %s not found, rproxyc will not start\n",
+        Printf("[PROXY] %s not found, rproxyc will not start\n",
                 PROXY_CONF_PATH);
         return -1;
     }
@@ -765,21 +775,31 @@ static int parse_proxy_config(proxy_config_t *cfg)
 
     /* Validate config */
     if (cfg->host[0] == '\0' || cfg->port == 0) {
-        fprintf(stderr, "[PROXY] invalid config (host=%s, port=%d), rproxyc will not start\n",
+        Printf("[PROXY] invalid config (host=%s, port=%d), rproxyc will not start\n",
                 cfg->host, cfg->port);
         return -1;
     }
 
-    printf("[PROXY] loaded from %s: %s:%d\n", PROXY_CONF_PATH, cfg->host, cfg->port);
+    Printf("[PROXY] loaded from %s: %s:%d\n", PROXY_CONF_PATH, cfg->host, cfg->port);
     return 0;
 }
+
+/* ======================== Poll Array ======================== */
+
+#define POLL_MAX_FDS    3   /* TCP server, TCP client, UDP server */
+
+enum { IDX_TCP_SERVER = 0, IDX_TCP_CLIENT, IDX_UDP_SERVER };
+
+static struct pollfd g_pollfds[POLL_MAX_FDS];
+static int g_poll_nfds = 1;  /* At least TCP server */
 
 /* ======================== Main Loop ======================== */
 
 static void signal_handler(int sig)
 {
-    (void)sig;
     g_running = 0;
+
+    Printf("recv signal:%d\n",sig);
     
     /* 强制关闭所有 fd，立即唤醒阻塞的系统调用 */
     if (g_client_fd >= 0) {
@@ -802,31 +822,36 @@ int main(void)
     signal(SIGINT,  signal_handler);
     signal(SIGTERM, signal_handler);
 
+    logInit(0);
+    atexit(logDeinit);
+
+    Printf("[MAIN] starting remote_control\n");
+
     /* Initialize PWM */
     if (pwm_init_all() < 0) {
-        fprintf(stderr, "PWM init failed\n");
+        Printf("PWM init failed\n");
         return 1;
     }
     set_defaults();
 
     /* Initialize ML307C (RNDIS + GNSS) */
     if (ml307c_init() < 0)
-        fprintf(stderr, "ML307C init failed, GPS will use default\n");
+        Printf("ML307C init failed, GPS will use default\n");
 
     /* Wait for IMEI and start rproxyc */
     {
         proxy_config_t proxy_cfg;
         if (parse_proxy_config(&proxy_cfg) != 0) {
-            fprintf(stderr, "[MAIN] proxy config failed, skip rproxyc\n");
+            Printf("[MAIN] proxy config failed, skip rproxyc\n");
         } else {
             char imei[32] = {0};
-            printf("[MAIN] waiting for IMEI...\n");
+            Printf("[MAIN] waiting for IMEI...\n");
             for (int i = 0; i < 120 && g_running; i++) {
                 if (ml307c_get_imei(imei, sizeof(imei))) {
                     if (system("pidof rproxyc > /dev/null 2>&1") == 0) {
-                        printf("[MAIN] rproxyc already running, skip\n");
+                        Printf("[MAIN] rproxyc already running, skip\n");
                     } else {
-                        printf("[MAIN] starting rproxyc with SN=%s, proxy=%s:%d\n", 
+                        Printf("[MAIN] starting rproxyc with SN=%s, proxy=%s:%d\n", 
                                imei, proxy_cfg.host, proxy_cfg.port);
                         char cmd[256];
                         snprintf(cmd, sizeof(cmd),
@@ -841,17 +866,17 @@ int main(void)
                     usleep(100000);  /* 100ms * 10 = 1s */
             }
             if (!g_running) {
-                printf("[MAIN] interrupted during IMEI wait, shutting down\n");
+                Printf("[MAIN] interrupted during IMEI wait, shutting down\n");
                 goto cleanup;
             }
             if (imei[0] == '\0')
-                fprintf(stderr, "[MAIN] IMEI timeout, rproxyc not started\n");
+                Printf("[MAIN] IMEI timeout, rproxyc not started\n");
         }
     }
 
     /* Initialize Audio (TCP 5102) */
     if (audio_init() < 0)
-        fprintf(stderr, "Audio init failed, intercom will be unavailable\n");
+        Printf("Audio init failed, intercom will be unavailable\n");
     else
         audio_start();
 
@@ -866,9 +891,21 @@ int main(void)
     /* Initialize UDP server */
     g_udp_server_fd = udp_init();
     if (g_udp_server_fd < 0) {
-        fprintf(stderr, "[UDP] init failed, UDP control disabled\n");
+        Printf("[UDP] init failed, UDP control disabled\n");
     }
 
+
+    /* Initialize poll array */
+    memset(g_pollfds, 0, sizeof(g_pollfds));
+    g_pollfds[IDX_TCP_SERVER].fd = g_server_fd;
+    g_pollfds[IDX_TCP_SERVER].events = POLLIN;
+    g_pollfds[IDX_TCP_CLIENT].fd = -1;
+    g_pollfds[IDX_UDP_SERVER].fd = -1;
+    g_poll_nfds = (g_udp_server_fd >= 0) ? IDX_UDP_SERVER + 1 : IDX_TCP_CLIENT + 1;
+    if (g_udp_server_fd >= 0) {
+        g_pollfds[IDX_UDP_SERVER].fd = g_udp_server_fd;
+        g_pollfds[IDX_UDP_SERVER].events = POLLIN;
+    }
 
     uint8_t rx_buf[64];
     int rx_len = 0;
@@ -877,34 +914,23 @@ int main(void)
     int64_t last_gps_ms  = time_ms();
 
     while (g_running) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(g_server_fd, &fds);
-        int maxfd = g_server_fd;
-        if (g_client_fd >= 0) {
-            FD_SET(g_client_fd, &fds);
-            if (g_client_fd > maxfd) maxfd = g_client_fd;
-        }
-        
-        /* Add UDP socket to select */
-        if (g_udp_server_fd >= 0) {
-            FD_SET(g_udp_server_fd, &fds);
-            if (g_udp_server_fd > maxfd) maxfd = g_udp_server_fd;
-        }
+        /* Update poll array fd values (client may connect/disconnect) */
+        g_pollfds[IDX_TCP_SERVER].fd = g_server_fd;
+        g_pollfds[IDX_TCP_CLIENT].fd = g_client_fd;
+        g_pollfds[IDX_UDP_SERVER].fd = g_udp_server_fd;
 
-        struct timeval tv = { 0, 10000 }; /* 10ms */
-        int ret = select(maxfd + 1, &fds, NULL, NULL, &tv);
+        int ret = poll(g_pollfds, g_poll_nfds, 10);  /* 10ms timeout */
         if (ret < 0) {
             if (errno == EINTR) continue;
-            perror("select"); break;
+            Printf("poll: %s\n", strerror(errno)); break;
         }
 
         /* Accept new TCP connection */
-        if (FD_ISSET(g_server_fd, &fds))
+        if (g_pollfds[IDX_TCP_SERVER].revents & POLLIN)
             accept_client();
 
         /* Receive TCP client data */
-        if (g_client_fd >= 0 && FD_ISSET(g_client_fd, &fds)) {
+        if (g_client_fd >= 0 && (g_pollfds[IDX_TCP_CLIENT].revents & POLLIN)) {
             int n = recv(g_client_fd, rx_buf + rx_len, sizeof(rx_buf) - rx_len, 0);
             if (n <= 0) {
                 disconnect_client();
@@ -945,7 +971,7 @@ int main(void)
         }
 
         /* Receive UDP client data */
-        if (g_udp_server_fd >= 0 && FD_ISSET(g_udp_server_fd, &fds)) {
+        if (g_udp_server_fd >= 0 && (g_pollfds[IDX_UDP_SERVER].revents & POLLIN)) {
             int n = recvfrom(g_udp_server_fd, udp_buf, sizeof(udp_buf), 0,
                             (struct sockaddr *)&g_udp_client_addr, &g_udp_client_addrlen);
             if (n > 0) {
@@ -1023,14 +1049,14 @@ int main(void)
     }
 
     /* Cleanup - order matters: stop threads first */
-    printf("\n[MAIN] shutting down...\n");
+    Printf("\n[MAIN] shutting down...\n");
     disconnect_client();
     
 cleanup:
     /* Stop audio threads */
     audio_stop();
     
-    /* Close server fd to unblock select() if waiting */
+    /* Close server fd to unblock poll() if waiting */
     if (g_server_fd >= 0) {
         close(g_server_fd);
         g_server_fd = -1;
@@ -1051,6 +1077,6 @@ cleanup:
     /* Cleanup PWM */
     pwm_deinit();
     
-    printf("[MAIN] Server stopped\n");
+    Printf("[MAIN] Server stopped\n");
     return 0;
 }
