@@ -183,7 +183,7 @@ struct rproxyUdpConnect *rproxyUdpConnectFind(int sock)
 */
 int recvUdpLocalData(struct rproxyUdpConnect *uct)
 {
-	char buf[BUF_SIZE];
+	char buf[OTHER_BUF_SIZE];
 	struct sockaddr_in localAddr;
 	socklen_t addrLen = sizeof(localAddr);
 	int ret;
@@ -220,7 +220,7 @@ int recvUdpLocalData(struct rproxyUdpConnect *uct)
 */
 int recvUdpServerData(struct rproxyUdpConnect *uct)
 {
-	char buf[BUF_SIZE];
+	char buf[OTHER_BUF_SIZE];
 	struct sockaddr_in serverAddr;
 	socklen_t addrLen = sizeof(serverAddr);
 	int ret;
@@ -307,9 +307,11 @@ void rproxyConnectFree(struct rproxyConnect *ct)
 		pollDelete(ct->serverSock);
 	}
 
+	memFree(ct->localBuf);
+	memFree(ct->serverBuf);
 	memFree(ct);
 	rproxy.connectCount--;
-	Printf("connectCount:%d\n",rproxy.connectCount);
+	Printf("[%s] connectCount:%d\n",portTypeStr(ct->portType),rproxy.connectCount);
 }
 
 /*
@@ -335,6 +337,8 @@ void rproxyConnectCleanAll(void)
 			if(ct->serverSock!=-1){
 				hlist_del(&ct->hashToServerSock);
 			}
+			memFree(ct->localBuf);
+			memFree(ct->serverBuf);
 			memFree(ct);
 			rproxy.connectCount--;
 		}
@@ -354,13 +358,13 @@ int rproxySendToLocal(struct rproxyConnect *ct)
 	}
 	ret=send(ct->localSock,ct->serverBuf,ct->serverBufUsed,0);
 	if(!ret){
-		Printf("Connect close by server\n");
+		Printf("[%s] local connection closed\n",portTypeStr(ct->portType));
 		return -1;
 	}
 	if(ret<0){
 		Printf("ret = %d errno=%d(%s)\n",ret,errno,strerror(errno));
 		if(!isIgnoreErrno(errno)){
-			Printf("Connect close by server\n");
+			Printf("[%s] local connection closed\n",portTypeStr(ct->portType));
 			return -1;
 		}
 		pollOutEvent(ct->localPollId,1);
@@ -393,13 +397,13 @@ int rproxySendToServer(struct rproxyConnect *ct)
 	}
 	ret=send(ct->serverSock,ct->localBuf,ct->localBufUsed,0);
 	if(!ret){
-		Printf("Connect close by server\n");
+		Printf("[%s] server connection closed\n",portTypeStr(ct->portType));
 		return -1;
 	}
 	if(ret<0){
 		Printf("ret = %d errno=%d(%s)\n",ret,errno,strerror(errno));
 		if(!isIgnoreErrno(errno)){
-			Printf("Connect close by server\n");
+			Printf("[%s] server connection closed\n",portTypeStr(ct->portType));
 			return -1;
 		}
 		pollOutEvent(ct->serverPollId,1);
@@ -427,9 +431,9 @@ int recvLocalData(struct rproxyConnect *ct)
 		return 0;
 	}
 
-	len=recv(ct->localSock,ct->localBuf+ct->localBufUsed,BUF_SIZE-ct->localBufUsed,0);
+	len=recv(ct->localSock,ct->localBuf+ct->localBufUsed,ct->localBufSize-ct->localBufUsed,0);
 	if(!len){
-		Printf("Connect close by server. sock=%d localBufUsed=%d\n",ct->localSock,ct->localBufUsed);
+		Printf("[%s] local connection closed. sock=%d localBufUsed=%d\n",portTypeStr(ct->portType),ct->localSock,ct->localBufUsed);
 		if(ct->localBufUsed){
 			/* 服务器关闭连接，发送剩余数据 */
 			close(ct->localSock);
@@ -467,13 +471,13 @@ int recvServerData(struct rproxyConnect *ct)
 {
 	int len;
 
-	if(ct->serverBufUsed==BUF_SIZE){	/* 没有剩余空间,等发送完了再接收 */
+	if(ct->serverBufUsed==ct->localBufSize){	/* 没有剩余空间,等发送完了再接收 */
 		goto send;
 	}
 
-	len=recv(ct->serverSock,ct->serverBuf+ct->serverBufUsed,BUF_SIZE-ct->serverBufUsed,0);
+	len=recv(ct->serverSock,ct->serverBuf+ct->serverBufUsed,ct->localBufSize-ct->serverBufUsed,0);
 	if(!len){
-		Printf("Connect close by server. sock=%d serverBufUsed=%d\n",ct->serverSock,ct->serverBufUsed);
+		Printf("[%s] server connection closed. sock=%d serverBufUsed=%d\n",portTypeStr(ct->portType),ct->serverSock,ct->serverBufUsed);
 		goto out;
 	}
 	if(len<0){
@@ -512,6 +516,15 @@ int rproxyNewConnect(__u8 portType, __u32 serverIp, __u16 serverPort)
 	}
 
 	rproxy.connectCount++;
+
+	int bufSize = getBufSizeByPortType(portType);
+	ct->localBufSize = bufSize;
+	ct->localBuf = memMalloc(bufSize);
+	ct->serverBuf = memMalloc(bufSize);
+	if(!ct->localBuf || !ct->serverBuf){
+		Printf("buffer alloc failed for %s (bufSize=%d)\n", portTypeStr(portType), bufSize);
+		goto Err;
+	}
 
 	ct->portType=portType;
 	ct->localIp=rproxy.localIp;
@@ -757,7 +770,7 @@ int sendMsgToServer(void *msg, int len)
 {
 	int ret=0;
 
-	Printf("send len:%d\n",len);
+	// Printf("send len:%d\n",len);
 	if(len>MAX_BUF_LEN-rproxy.sendBufUsed){
 		Printf("len=%d sendBufUsed=%d discarded!\n",len,rproxy.sendBufUsed);
 		return -1;
@@ -769,13 +782,13 @@ int sendMsgToServer(void *msg, int len)
 
 	ret=send(rproxy.serverSock,rproxy.sendBuf,rproxy.sendBufUsed,0);
 	if(!ret){
-		Printf("Connection closed by server. 1\n");
+		Printf("[control] server connection closed\n");
 		rproxy.sendBufUsed=0;
 		return -1;
 	}
 	if(ret<0){
 		if(!isIgnoreErrno(errno)){
-			Printf("Connection closed by server. 2\n");
+			Printf("[control] server connection closed\n");
 			rproxy.sendBufUsed=0;
 			return -1;
 		}
@@ -787,7 +800,7 @@ int sendMsgToServer(void *msg, int len)
 		rproxy.pollArray[rproxy.serverPollIndex].events |= POLLOUT;
 	}else{
 		rproxy.pollArray[rproxy.serverPollIndex].events &= ~POLLOUT;
-		Printf("send ok\n");
+		// Printf("send ok\n");
 	}
 
 	return 0;
@@ -880,7 +893,7 @@ void sendUdpHeartbeat(unsigned long data)
 			sendto(rproxy.udpControlConn->serverSock, heartbeat, strlen(heartbeat), 0,
 				   (struct sockaddr *)&rproxy.udpControlConn->serverAddr, sizeof(rproxy.udpControlConn->serverAddr));
 			rproxy.udpControlConn->lastSendTime = now;
-			Printf("UDP heartbeat sent\n");
+			// Printf("UDP heartbeat sent\n");
 		}
 	}
 
@@ -979,7 +992,7 @@ int recvProxyServerMsg()
 
 	ret=recv(rproxy.serverSock,rproxy.recvBuf+rproxy.recvBufUsed,MAX_BUF_LEN-rproxy.recvBufUsed,0);
 	if(!ret){
-		Printf("Connection closed by server. 3\n");
+		Printf("[control] server connection closed\n");
 		return -1;
 	}
 
@@ -987,11 +1000,11 @@ int recvProxyServerMsg()
 		if(errno==EINTR || errno==EWOULDBLOCK || errno==EAGAIN){
 			ret=0;
 		}else{
-			Printf("Connection closed by server. 4\n");
+			Printf("[control] server connection closed\n");
 			return -1;
 		}
 	}
-	Printf("recv %d bytes\n",ret);
+	// Printf("recv %d bytes\n",ret);
 	rproxy.recvBufUsed+=ret;
 
 again:
@@ -1295,6 +1308,10 @@ int main(int argc, char **argv)
 	if(argc>=5){
 		rproxy.debug = atoi(argv[4]);
 	}
+
+	logInit(rproxy.debug);
+	atexit(logDeinit);
+	Printf("Starting rproxyc\n");
 
 	/* 解析服务器地址 */
 	Printf("hostToIp:%s\n",rproxy.serverHost);

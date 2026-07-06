@@ -18,7 +18,7 @@ STRIP := $(RK_APP_CROSS)-strip
 CFLAGS += -I./include -I./source -Wall -O2
 LDFLAGS +=
 
-SRCS := source/rproxyc.c source/timer.c
+SRCS := source/rproxyc.c source/timer.c source/log.c
 
 PKG_TARGET := rproxyc-build
 

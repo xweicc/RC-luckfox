@@ -28,17 +28,34 @@
 #include <timer.h>
 
 #include "rproxy_msg_def.h"
+#include "log.h"
 
 #define MAX_BUF_LEN 10240
 #define RPROXY_KEEP_ALIVE_TIME 60          /* 1分钟 */
 #define RPROXY_TIMEOUT_COUNT_MAX 2
 #define POLL_MAX_NUM 1024
 #define RPROXY_RECONNECT_TIME 5            /* 断开后5秒重连 */
-#define Printf(format,args...) do{if(rproxy.debug) printf("[%s:%d]:"format,__FUNCTION__,__LINE__,##args);}while(0)
+/* Printf 宏已移至 log.h */
 
 #define CONNECT_HLIST_MASK 0xFF
 #define CONNECT_HLIST_SIZE 0x100
-#define BUF_SIZE (64 * 1024)
+#define VIDEO_BUF_SIZE (128 * 1024)   /* video0/video1/rearCam: 容纳大I帧 */
+#define AUDIO_BUF_SIZE (32 * 1024)    /* audio */
+#define OTHER_BUF_SIZE (8 * 1024)     /* control/videoCtrl/ssh */
+
+static inline int getBufSizeByPortType(__u8 portType)
+{
+	switch(portType){
+		case portTypeVideo0:
+		case portTypeVideo1:
+		case portTypeRearCam:
+			return VIDEO_BUF_SIZE;
+		case portTypeAudio:
+			return AUDIO_BUF_SIZE;
+		default:
+			return OTHER_BUF_SIZE;
+	}
+}
 
 enum{
 	dataFromLocal,
@@ -61,8 +78,9 @@ struct rproxyConnect{
 	int localSock;              /* 本地服务器的Socket */
 	int serverSock;             /* 远端服务器的Socket */
 
-	char localBuf[BUF_SIZE];    /* 从本地服务器收到的数据,或发往远端服务器的数据 */
-	char serverBuf[BUF_SIZE];   /* 从远端服务器收到的数据,或发往本地服务器的数据 */
+	char *localBuf;               /* 从本地服务器收到的数据,或发往远端服务器的数据 */
+	char *serverBuf;              /* 从远端服务器收到的数据,或发往本地服务器的数据 */
+	int localBufSize;             /* 缓冲区大小(按portType分配) */
 	int localBufUsed;
 	int serverBufUsed;
 
