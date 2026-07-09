@@ -3,12 +3,15 @@
  *
  * 功能：
  * - 监听 TCP 5102 端口
- * - 接收客户端连接后，发送麦克风采集的 PCM 流（16kHz/stereo/16bit）
- * - 接收客户端的 PCM 流并播放
+ * - 接收客户端连接后，发送麦克风采集的音频流
+ * - 接收客户端的音频流，解码后播放
  * - 播放期间暂停录音，避免回声（无 AEC）
  * - 音频收发在独立线程处理
  *
- * 音频格式：16kHz 采样率 / 立体声(硬件要求) / 16bit
+ * 音频格式：
+ *   硬件侧：16kHz / 立体声(硬件要求) / 16bit PCM
+ *   网络侧：USE_G711A=1 时 16kHz/mono/G.711a (320 bytes/frame)
+ *            USE_G711A=0 时 16kHz/mono/PCM16LE (640 bytes/frame)
  * 底层接口：ALSA (libasound)，不依赖 Rockchip MPI
  *
  * 使用方式：
@@ -27,6 +30,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <stdint.h>
 #include <alsa/asoundlib.h>
 #include "log.h"
 
@@ -39,9 +43,16 @@
 #define AUDIO_FRAME_SAMPLES     320     /* 每帧采样点数 (20ms @ 16kHz) */
 #define AUDIO_BUFFER_BYTES      (AUDIO_FRAME_SAMPLES * AUDIO_CHANNELS * (AUDIO_BIT_WIDTH / 8))
 
-/* 客户端音频格式（单声道） */
+/* 客户端音频格式 */
 #define CLIENT_AUDIO_CHANNELS   1       /* 客户端发送单声道 */
-#define CLIENT_BUFFER_BYTES     (AUDIO_FRAME_SAMPLES * CLIENT_AUDIO_CHANNELS * (AUDIO_BIT_WIDTH / 8))
+#define USE_G711A               1       /* 1=G.711a编码(320B/帧), 0=原始PCM16LE(640B/帧) */
+
+#if USE_G711A
+#define CLIENT_BYTES_PER_SAMPLE 1       /* G.711a: 每个采样点 1 byte */
+#else
+#define CLIENT_BYTES_PER_SAMPLE 2       /* 原始 PCM: 每个采样点 2 bytes (16bit) */
+#endif
+#define CLIENT_BUFFER_BYTES     (AUDIO_FRAME_SAMPLES * CLIENT_AUDIO_CHANNELS * CLIENT_BYTES_PER_SAMPLE)
 
 /* ALSA 设备名称 */
 #define ALSA_PCM_DEVICE         "hw:0,0"
@@ -55,6 +66,68 @@
 #define LOG_INFO(fmt, ...)  Printf("[Audio][I] " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  Printf("[Audio][W] " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERR(fmt, ...)   Printf("[Audio][E] " fmt "\n", ##__VA_ARGS__)
+
+/* ======================== G.711a (A-law) 编解码 ======================== */
+
+#if USE_G711A
+
+/* G.711a 编码：16-bit 线性 PCM → 8-bit A-law (ITU-T G.711) */
+static uint8_t pcm_to_alaw(int16_t pcm_val) {
+    int pcm = pcm_val;
+    uint8_t sign;
+    int seg;
+
+    if (pcm < 0) {
+        sign = 0x80;
+        pcm = -pcm;
+    } else {
+        sign = 0x00;
+    }
+    if (pcm > 32767) pcm = 32767;
+
+    /* 确定段号 (ITU-T 标准: seg 0-7) */
+    if (pcm < 256) {
+        seg = 0;
+    } else {
+        seg = 1;
+        while (seg < 7 && pcm >= (256 << seg)) seg++;
+    }
+
+    /* 提取段内 4-bit 量化值 */
+    int mantissa;
+    if (seg == 0) {
+        mantissa = (pcm >> 4) & 0x0F;
+    } else {
+        mantissa = (pcm >> (seg + 1)) & 0x0F;
+    }
+
+    int aval = (seg << 4) | mantissa;
+    return (uint8_t)(sign | (aval ^ 0x55));
+}
+
+/* G.711a 解码：8-bit A-law → 16-bit 线性 PCM (ITU-T G.711) */
+static int16_t alaw_to_pcm(uint8_t alaw_val) {
+    int sign, seg, mantissa;
+    int pcm;
+
+    /* 先提取符号位，再 XOR 还原数据位 */
+    sign = (alaw_val & 0x80) ? 0x80 : 0x00;
+    alaw_val ^= 0x55;
+    int aval = alaw_val & 0x7F;
+
+    seg = (aval >> 4) & 0x07;
+    mantissa = aval & 0x0F;
+
+    if (seg == 0) {
+        pcm = (mantissa << 4) + 8;
+    } else {
+        pcm = ((mantissa << 4) + 0x108) << (seg - 1);
+    }
+
+    return (int16_t)(sign ? -pcm : pcm);
+}
+
+#endif /* USE_G711A */
 
 /* ======================== GPIO 控制 ======================== */
 
@@ -196,6 +269,34 @@ static int alsa_set_params(snd_pcm_t *pcm, snd_pcm_stream_t stream) {
     return 0;
 }
 
+/* ======================== ALSA Mixer 控制 ======================== */
+
+/**
+ * 设置 ALSA mixer 控件（通过 amixer 命令行）
+ */
+static void alsa_mixer_set(const char *control, const char *value) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "amixer set '%s' %s >/dev/null 2>&1", control, value);
+    int ret = system(cmd);
+    if (ret != 0) {
+        LOG_WARN("amixer set '%s' %s failed (ret=%d)", control, value, ret);
+    } else {
+        LOG_INFO("amixer set '%s' %s OK", control, value);
+    }
+}
+
+/**
+ * 配置采集端增益参数
+ */
+static void alsa_capture_setup_mixer(void) {
+    alsa_mixer_set("ADC ALC Left", "26");
+    alsa_mixer_set("ADC ALC Right", "26");
+    alsa_mixer_set("ADC MIC Left Gain", "3");
+    alsa_mixer_set("ADC MIC Right Gain", "3");
+    alsa_mixer_set("ADC MICBIAS Voltage", "VREFx0_975");
+    alsa_mixer_set("ADC Mode", "SingadcL");
+}
+
 /* ======================== 音频输入初始化 ======================== */
 
 static int audio_capture_init(void) {
@@ -244,6 +345,9 @@ static int audio_capture_enable(void) {
         g_pcm_capture = NULL;
         return -1;
     }
+
+    /* 配置采集端增益（ALC + MIC Gain） */
+    alsa_capture_setup_mixer();
 
     g_capture_enabled = 1;
     LOG_INFO("=== ALSA capture enabled (lazy startup on client connect) ===");
@@ -327,17 +431,27 @@ static void audio_playback_disable(void) {
 
 static void *audio_send_thread(void *arg) {
     char stereo_buf[AUDIO_BUFFER_BYTES];  /* 立体声采集缓冲区 (1280 bytes) */
-    char mono_buf[CLIENT_BUFFER_BYTES];   /* 单声道发送缓冲区 (640 bytes) */
+    int16_t mono_samples[AUDIO_FRAME_SAMPLES];  /* 单声道 PCM (640 bytes) */
+#if USE_G711A
+    uint8_t client_buf[CLIENT_BUFFER_BYTES];    /* G.711a 编码缓冲区 (320 bytes) */
+#else
+    uint8_t *client_buf = (uint8_t *)mono_samples;  /* 原始 PCM: 直接发送单声道 (640 bytes) */
+#endif
     snd_pcm_sframes_t frames;
 
     LOG_INFO("Audio send thread started");
     LOG_INFO("Capture format: 16kHz/%dch/%dbit (%zu bytes/frame)",
              AUDIO_CHANNELS, AUDIO_BIT_WIDTH, (size_t)AUDIO_BUFFER_BYTES);
-    LOG_INFO("Send format: 16kHz/%dch/%dbit (%zu bytes/frame)",
-             CLIENT_AUDIO_CHANNELS, AUDIO_BIT_WIDTH, (size_t)CLIENT_BUFFER_BYTES);
+#if USE_G711A
+    LOG_INFO("Send format: 16kHz/mono/G.711a (%zu bytes/frame)",
+             (size_t)CLIENT_BUFFER_BYTES);
+#else
+    LOG_INFO("Send format: 16kHz/mono/PCM16LE (%zu bytes/frame)",
+             (size_t)CLIENT_BUFFER_BYTES);
+#endif
 
     while (g_audio_running && g_client_fd >= 0) {
-        /* 从 ALSA 采集立体声数据 */
+        /* 从 ALSA 采集立体声数据（阻塞） */
         frames = snd_pcm_readi(g_pcm_capture, stereo_buf, AUDIO_FRAME_SAMPLES);
         if (frames < 0) {
             if (frames == -EPIPE) {
@@ -349,27 +463,31 @@ static void *audio_send_thread(void *arg) {
             break;
         }
 
-        /* 播放中暂停发送，避免回声 */
+        /* 播放中暂停发送，避免回声（无 AEC） */
         if (g_is_playing) {
             continue;
         }
 
-        /* 立体声 → 单声道转换（只使用左声道，RV1103 MIC0P 是左声道） */
+        /* 立体声 → 单声道（只使用左声道，RV1103 MIC0P 是左声道） */
         int16_t *stereo_samples = (int16_t *)stereo_buf;
-        int16_t *mono_samples = (int16_t *)mono_buf;
-
         for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-            mono_samples[i] = stereo_samples[i * 2];  /* 只取左声道 */
+            mono_samples[i] = stereo_samples[i * 2];
         }
 
-        /* 发送单声道数据到客户端 */
-        size_t bytes = CLIENT_BUFFER_BYTES;
-        ssize_t sent = send(g_client_fd, mono_buf, bytes, MSG_NOSIGNAL);
+        /* 单声道 PCM → 客户端格式 */
+#if USE_G711A
+        for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+            client_buf[i] = pcm_to_alaw(mono_samples[i]);
+        }
+#endif
+
+        /* 发送数据到客户端 */
+        ssize_t sent = send(g_client_fd, client_buf, CLIENT_BUFFER_BYTES, MSG_NOSIGNAL);
         if (sent < 0) {
             LOG_ERR("Send audio failed: %s", strerror(errno));
             break;
-        } else if ((size_t)sent != bytes) {
-            LOG_WARN("Partial send: %zd/%zu bytes", sent, bytes);
+        } else if ((size_t)sent != CLIENT_BUFFER_BYTES) {
+            LOG_WARN("Partial send: %zd/%zu bytes", sent, (size_t)CLIENT_BUFFER_BYTES);
         }
     }
 
@@ -381,15 +499,20 @@ static void *audio_send_thread(void *arg) {
 
 static void *audio_recv_thread(void *arg) {
     char stereo_buf[AUDIO_BUFFER_BYTES];  /* 立体声缓冲区 (1280 bytes) */
-    char mono_buf[CLIENT_BUFFER_BYTES];   /* 单声道接收缓冲区 (640 bytes) */
-    size_t mono_offset = 0;
-    const size_t mono_frame_bytes = CLIENT_BUFFER_BYTES;
+    uint8_t client_buf[CLIENT_BUFFER_BYTES];  /* 客户端数据接收缓冲区 */
+    size_t client_offset = 0;
+    const size_t client_frame_bytes = CLIENT_BUFFER_BYTES;
     int total_received = 0;
     int frame_count = 0;
 
     LOG_INFO("Audio recv thread started");
-    LOG_INFO("Client format: 16kHz/%dch/%dbit (%zu bytes/frame)",
-             CLIENT_AUDIO_CHANNELS, AUDIO_BIT_WIDTH, mono_frame_bytes);
+#if USE_G711A
+    LOG_INFO("Client format: 16kHz/mono/G.711a (%zu bytes/frame)",
+             client_frame_bytes);
+#else
+    LOG_INFO("Client format: 16kHz/mono/PCM16LE (%zu bytes/frame)",
+             client_frame_bytes);
+#endif
     LOG_INFO("Device format: 16kHz/%dch/%dbit (%zu bytes/frame)",
              AUDIO_CHANNELS, AUDIO_BIT_WIDTH, (size_t)AUDIO_BUFFER_BYTES);
 
@@ -411,9 +534,9 @@ static void *audio_recv_thread(void *arg) {
             }
         }
         
-        /* 从客户端接收单声道数据 */
-        size_t space = mono_frame_bytes - mono_offset;
-        ssize_t received = recv(g_client_fd, mono_buf + mono_offset, space, 0);
+        /* 从客户端接收数据 */
+        size_t space = client_frame_bytes - client_offset;
+        ssize_t received = recv(g_client_fd, client_buf + client_offset, space, 0);
         if (received <= 0) {
             if (received < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -428,22 +551,29 @@ static void *audio_recv_thread(void *arg) {
         }
 
         total_received += received;
-        mono_offset += received;
+        client_offset += received;
 
-        /* 未凑满一帧单声道数据，继续接收 */
-        if (mono_offset < mono_frame_bytes) {
+        /* 未凑满一帧数据，继续接收 */
+        if (client_offset < client_frame_bytes) {
             continue;
         }
 
-        /* 满帧单声道：转换为立体声（左右声道相同） */
-        int16_t *mono_samples = (int16_t *)mono_buf;
+        /* 满帧：解码为单声道 PCM，再转换为立体声 */
         int16_t *stereo_samples = (int16_t *)stereo_buf;
         
+#if USE_G711A
         for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-            int16_t sample = mono_samples[i];
+            int16_t sample = alaw_to_pcm(client_buf[i]);
             stereo_samples[i * 2]     = sample;  /* 左声道 */
             stereo_samples[i * 2 + 1] = sample;  /* 右声道 */
         }
+#else
+        int16_t *mono = (int16_t *)client_buf;
+        for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+            stereo_samples[i * 2]     = mono[i];  /* 左声道 */
+            stereo_samples[i * 2 + 1] = mono[i];  /* 右声道 */
+        }
+#endif
 
         /* 写入 ALSA 播放立体声 */
         frame_count++;
@@ -473,7 +603,7 @@ static void *audio_recv_thread(void *arg) {
         /* 写入成功后才标记为播放中（ALSA 缓冲区有数据在播放） */
         g_is_playing = 1;
 
-        mono_offset = 0;
+        client_offset = 0;
     }
 
     LOG_INFO("Audio recv thread exited (total received: %d bytes, %d frames, avg: %d bytes/frame)",
@@ -590,7 +720,12 @@ int audio_init(void) {
     int opt = 1;
 
     Printf("[Audio] Initializing audio module (ALSA)...\n");
-    Printf("[Audio] Format: %dHz/%dch/%dbit\n", AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BIT_WIDTH);
+    Printf("[Audio] HW format: %dHz/%dch/%dbit\n", AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BIT_WIDTH);
+#if USE_G711A
+    Printf("[Audio] Network format: %dHz/mono/G.711a (%d bytes/frame)\n", AUDIO_SAMPLE_RATE, CLIENT_BUFFER_BYTES);
+#else
+    Printf("[Audio] Network format: %dHz/mono/PCM16LE (%d bytes/frame)\n", AUDIO_SAMPLE_RATE, CLIENT_BUFFER_BYTES);
+#endif
     Printf("[Audio] TCP port: %d\n", TCP_AUDIO_PORT);
 
     /* 初始化 ALSA 采集 */
