@@ -41,6 +41,7 @@
 #define MOTOR_PWM_FREQ_HZ      1000    /* Motor PWM frequency */
 #define MOTOR_PWM_PERIOD_NS    (1000000000LL / MOTOR_PWM_FREQ_HZ)   /* 1000000 ns = 1ms */
 #define MOTOR_MIN_DUTY         80      /* 电机最小启动占空比 */
+#define MOTOR_REV_MAX_DUTY     150     /* 倒车最大占空比 (前进为512) */
 #define MOTOR_DEAD_ZONE        10      /* 电机死区范围 */
 
 /* 灯光PWM参数 (内置MOS管控制模式) */
@@ -410,9 +411,8 @@ static void apply_motor(uint16_t throttle)
         } else if (new_dir == -1) {
             /* Backward: PWM10(CH1) outputs PWM, PWM11 fixed low */
             duty = 512 - throttle;
-            /* 非线性曲线: 前段缓慢上升，后端快速上升 (二次方) */
-            /* duty ∈ [0,512] → out ∈ [MOTOR_MIN_DUTY, 512] */
-            duty = MOTOR_MIN_DUTY + (int64_t)(512 - MOTOR_MIN_DUTY) * duty * duty / (512 * 512);
+            /* 倒车限速: 占空比上限MOTOR_REV_MAX_DUTY (前进上限512) */
+            duty = MOTOR_MIN_DUTY + (int64_t)(MOTOR_REV_MAX_DUTY - MOTOR_MIN_DUTY) * duty * duty / (512 * 512);
             pwm_set_duty(g_pwm_fd[IDX_CH1], (int64_t)duty * MOTOR_PWM_PERIOD_NS / 512);
             pwm_set_duty(g_pwm11_fd, 0);
         } else {
