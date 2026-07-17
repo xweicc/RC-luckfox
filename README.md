@@ -1,365 +1,286 @@
-![luckfox](https://github.com/LuckfoxTECH/luckfox-pico/assets/144299491/cec5c4a5-22b9-4a9a-abb1-704b11651e88)
-# Luckfox Pico SDK
-[中文版](./README_CN.md)
-* This SDK is modified based on the SDK provided by Rockchip
-* It provides a customized SDK specifically for Luckfox Pico series development boards 
-* Aimed at providing developers with a better programming experience
-## SDK Updatelog
-+ Current Version: V1.4
-1. Updated U-Boot to support fast boot for RV1106 using SPI NAND and eMMC.
-2. Optimized U-Boot compatibility with SD cards, reducing the likelihood of SD card recognition failures.
-3. Updated the kernel version to 5.10.160, increasing the NPU frequency for RV1106G3.
-4. Updated the Buildroot mirror source for more stable package downloads.
-5. Added support for custom file systems.
-6. Partial bug fixes
-## SDK Usage Instructions
-* recommended operating system : Ubuntu 22.04 
-### Installing Dependencies
-```shell
-sudo apt-get install -y git ssh make gcc gcc-multilib g++-multilib module-assistant expect g++ gawk texinfo libssl-dev bison flex fakeroot cmake unzip gperf autoconf device-tree-compiler libncurses5-dev pkg-config bc python-is-python3 passwd openssl openssh-server openssh-client vim file cpio rsync
+# 4G 远程遥控车 — Luckfox Pico Plus
+
+基于 Luckfox Pico（RV1103）的 4G 远程遥控车方案，支持 H.265 视频流推送、双向语音对讲、PWM 电机/舵机控制，通过反向代理实现跨网络远程控制。
+
+**硬件开源地址**：<https://oshwhub.com/qwiaoei/project_jzgihors>
+
+---
+
+## 功能特性
+
+- **视频**：SC3336 传感器 + USB 摄像头双路 H.265 编码，TCP 推流
+- **控制**：TCP 服务端（端口 5103），PWM 电机驱动（RZ7899-MS）、舵机转向、灯光控制
+- **通信**：ML307C 4G 模组拨号上网，rproxyc/rproxys 反向代理穿透 NAT
+- **对讲**：ALSA 音频采集，G.711a 编码，双向语音
+- **遥测**：每秒上报电池电压，支持倒车限速、非线性油门曲线
+
+---
+
+## 系统架构
+
 ```
-### Get SDK
+┌─────────────────────────────────────────────────────────┐
+│                    云端 / VPS                            │
+│                     rproxys                              │
+│          反向代理服务端，管理端口池，分配7个流端口          │
+└──────────────────────┬──────────────────────────────────┘
+                       │ TCP / UDP
+        ┌──────────────┴──────────────┐
+        │         4G / 互联网          │
+        └──────────────┬──────────────┘
+                       │
+┌──────────────────────┴──────────────────────────────────┐
+│              Luckfox Pico Plus（RV1103）                  │
+│                                                         │
+│  ┌─────────────┐  ┌──────────┐  ┌───────────────────┐  │
+│  │  rkipc      │  │ rproxyc  │  │  remote_control   │  │
+│  │  视频采集    │  │ 反向代理  │  │  TCP:5103 控制服务 │  │
+│  │  H.265 编码  │  │ 客户端   │  │  PWM 电机/舵机/灯  │  │
+│  │  TCP 推流    │  │ 7路流上传 │  │  ML307C 4G 拨号   │  │
+│  └─────────────┘  └──────────┘  │  音频采集 G.711a   │  │
+│                                  │  电池电压遥测      │  │
+│                                  └───────────────────┘  │
+│                                                         │
+│  硬件接口：                                              │
+│  · SC3336 CSI 摄像头  · USB 摄像头（UVC）               │
+│  · ML307C 4G 模组（USB）  · RZ7899-MS 电机驱动（PWM8/9）│
+│  · 转向舵机（PWM10）  · 灯光（PWM11）  · ADC 电池电压    │
+└─────────────────────────────────────────────────────────┘
 ```
-git clone https://github.com/LuckfoxTECH/luckfox-pico.git
+
+### 核心模块说明
+
+| 模块 | 路径 | 说明 |
+|------|------|------|
+| `remote_control` | `project/app/remote_control/` | 主控制服务，TCP 服务端，PWM 输出，4G 拨号，音频采集 |
+| `rkipc` | `project/app/rkipc/` | Rockchip IPC 视频采集，H.265 双码流编码，TCP 推流 |
+| `rproxyc` | `project/app/rproxyc/` | 反向代理客户端，连接 rproxys 并上传 7 路流 |
+| `rproxys` | `tools/rproxys/` | 反向代理服务端，部署在云端，管理设备连接和端口分配 |
+
+---
+
+## 目录结构
+
 ```
-### Environment Variables
-* The cross-compilation toolchain needs to be set Environment Variables
+RC-luckfox/
+├── project/
+│   ├── build.sh                    # 主构建脚本
+│   ├── rkflash.sh                  # 烧录脚本
+│   ├── app/
+│   │   ├── remote_control/         # 遥控车主程序
+│   │   │   └── source/
+│   │   │       ├── remote_control.c  # TCP 服务、PWM 控制、主循环
+│   │   │       ├── ml307c.c          # ML307C 4G 模组 AT 指令、拨号、GPS
+│   │   │       ├── audio.c           # ALSA 音频后端
+│   │   │       └── log.c             # 日志模块
+│   │   ├── rkipc/                  # 视频采集（基于 Rockchip media）
+│   │   └── rproxyc/                # 反向代理客户端
+│   └── cfg/
+│       └── BoardConfig_IPC/        # 板级配置、overlay 开机脚本
+├── tools/
+│   ├── rproxys/                    # 反向代理服务端（x86 部署）
+│   └── linux/                      # Linux 工具（烧录工具等）
+├── media/                          # Rockchip media 库及算法
+├── sysdrv/                         # U-Boot、Kernel、Buildroot
+├── output/                         # 编译输出目录
+└── IMAGE/                          # 打包好的固件镜像
 ```
-cd {SDK_PATH}/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/
+
+---
+
+## 编译
+
+### 环境要求
+
+- **操作系统**：Ubuntu 22.04（推荐）
+- **依赖包**：
+
+```bash
+sudo apt-get install repo git ssh make gcc gcc-multilib g++-multilib \
+  module-assistant expect g++ gawk texinfo libssl-dev bison flex \
+  fakeroot cmake unzip gperf autoconf device-tree-compiler \
+  libncurses5-dev pkg-config bc python-is-python3 passwd openssl \
+  openssh-server openssh-client vim file cpio rsync
+```
+
+### 获取源码
+
+```bash
+git clone <本仓库地址> RC-luckfox
+cd RC-luckfox
+```
+
+### 配置工具链
+
+```bash
+cd tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/
 source env_install_toolchain.sh
+cd ../../../..
 ```
-### Get the SDK
-* GitHub
-    ```
-    git clone <https://github.com/LuckfoxTECH/luckfox-pico.git>
-    ```
-* Gitee
-    ```
-    git clone <https://gitee.com/LuckfoxTECH/luckfox-pico.git>
-    ```
-### Instructions for build.sh
-* The build.sh script is used to automate the compilation process. 
-* Most of the compilation operations can be completed automatically through build.sh.
-#### Options for build.sh
-```shell
-Usage: build.sh [OPTIONS]
-Available options:
-lunch              -Select Board Configure
-env                -build env
-meta               -build meta (optional)
-uboot              -build uboot
-kernel             -build kernel
-rootfs             -build rootfs
-driver             -build kernel's drivers
-sysdrv             -build uboot, kernel, rootfs
-media              -build rockchip media libraries
-app                -build app
-recovery           -build recovery
-tool               -build tool
-updateimg          -build update image
-unpackimg          -unpack update image
-factory            -build factory image
-all                -build uboot, kernel, rootfs, recovery image
-allsave            -build all & firmware & save
 
-clean              -clean all
-clean uboot        -clean uboot
-clean kernel       -clean kernel
-clean driver       -clean driver
-clean rootfs       -clean rootfs
-clean sysdrv       -clean uboot/kernel/rootfs
-clean media        -clean rockchip media libraries
-clean app          -clean app
-clean recovery     -clean recovery
+### 编译全部固件
 
-firmware           -pack all the image we need to boot up system
-ota                -pack update_ota.tar
-save               -save images, patches, commands used to debug
-check              -check the environment of building
-info               -see the current board building information
-
-buildrootconfig    -config buildroot and save defconfig"
-kernelconfig       -config kernel and save defconfig"
-```
-#### Select the referenced board configuration
-```shell
+```bash
+# 选择板级配置（Luckfox Pico Plus）
 ./build.sh lunch
+
+# 编译全部（U-Boot + Kernel + Rootfs + App + 打包）
+./build.sh allsave
 ```
-+ Output the corresponding Luckfox-pico hardware model. Enter the corresponding number to proceed to the storage media options (press Enter to select option [0] directly).
-  ```shell 
-  You're building on Linux
-  Lunch menu...pick the Luckfox Pico hardware version:
-  选择 Luckfox Pico 硬件版本:
-                [0] RV1103_Luckfox_Pico
-                [1] RV1103_Luckfox_Pico_Mini
-                [2] RV1103_Luckfox_Pico_Plus
-                [3] RV1103_Luckfox_Pico_WebBee
-                [4] RV1106_Luckfox_Pico_Pro_Max
-                [5] RV1106_Luckfox_Pico_Ultra
-                [6] RV1106_Luckfox_Pico_Ultra_W
-                [7] RV1106_Luckfox_Pico_Pi
-                [8] RV1106_Luckfox_Pico_Pi_W
-                [9] RV1106_Luckfox_Pico_86Panel
-                [10] RV1106_Luckfox_Pico_86Panel_W
-                [11] custom
-  Which would you like? [0~11][default:0]:
-  ```
-+ Output the supported storage media for the corresponding Luckfox-pico hardware model. Enter the corresponding number to proceed to the root filesystem options (press Enter to select option [0] directly).For example, Luckfox Pico Plus.
-  ```shell
-    Lunch menu...pick the boot medium:
-    选择启动媒介:
-                  [0] SD_CARD
-                  [1] SPI_NAND
 
-  Which would you like? [0~1][default:0]:
-  ```
-+ Output the supported root filesystem types for the corresponding Luckfox-pico hardware model. Enter the corresponding number to complete the configuration (press Enter to select option [0] directly).
-  ```shell
-    Lunch menu...pick the system version:
-    选择系统版本:
-                  [0] Buildroot(Support Rockchip official features)
+### 仅编译应用层
 
-  Which would you like? [0~1][default:0]:
-  ```
-+ If you need to use the old configuration method or a custom board support file, select the "[7]custom" option when configuring the Luckfox-pico hardware model.
-  ```shell 
-  You're building on Linux
-    Lunch menu...pick the Luckfox Pico hardware version:
-    选择 Luckfox Pico 硬件版本:
-                  [0] RV1103_Luckfox_Pico
-                  [1] RV1103_Luckfox_Pico_Mini
-                  [2] RV1103_Luckfox_Pico_Plus
-                  [3] RV1103_Luckfox_Pico_WebBee
-                  [4] RV1106_Luckfox_Pico_Pro_Max
-                  [5] RV1106_Luckfox_Pico_Ultra
-                  [6] RV1106_Luckfox_Pico_Ultra_W
-                  [7] RV1106_Luckfox_Pico_Pi
-                  [8] RV1106_Luckfox_Pico_Pi_W
-                  [9] RV1106_Luckfox_Pico_86Panel
-                  [10] RV1106_Luckfox_Pico_86Panel_W
-                  [11] custom
-  Which would you like? [0~11][default:0]: 11
-  ----------------------------------------------------------------
-  0. BoardConfig_IPC/BoardConfig-EMMC-Buildroot-RV1106_Luckfox_Pico_86Panel-IPC.mk
-                               boot medium(启动介质): EMMC
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_86Panel
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  1. BoardConfig_IPC/BoardConfig-EMMC-Buildroot-RV1106_Luckfox_Pico_86Panel_W-IPC.mk
-                               boot medium(启动介质): EMMC
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_86Panel_W
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  2. BoardConfig_IPC/BoardConfig-EMMC-Buildroot-RV1106_Luckfox_Pico_Pi-IPC.mk
-                               boot medium(启动介质): EMMC
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_Pi
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  3. BoardConfig_IPC/BoardConfig-EMMC-Buildroot-RV1106_Luckfox_Pico_Pi_W-IPC.mk
-                               boot medium(启动介质): EMMC
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_Pi_W
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  4. BoardConfig_IPC/BoardConfig-EMMC-Buildroot-RV1106_Luckfox_Pico_Ultra-IPC.mk
-                               boot medium(启动介质): EMMC
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_Ultra
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  5. BoardConfig_IPC/BoardConfig-EMMC-Buildroot-RV1106_Luckfox_Pico_Ultra_W-IPC.mk
-                               boot medium(启动介质): EMMC
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_Ultra_W
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  6. BoardConfig_IPC/BoardConfig-EMMC-Busybox-RV1106_Luckfox_Pico_Ultra-IPC_FASTBOOT.mk
-                               boot medium(启动介质): EMMC
-                            system version(系统版本): Busybox
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_Ultra
-                               application(应用场景): IPC_FASTBOOT
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  7. BoardConfig_IPC/BoardConfig-SD_CARD-Buildroot-RV1103_Luckfox_Pico-IPC.mk
-                               boot medium(启动介质): SD_CARD
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1103_Luckfox_Pico
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  8. BoardConfig_IPC/BoardConfig-SD_CARD-Buildroot-RV1103_Luckfox_Pico_Mini-IPC.mk
-                               boot medium(启动介质): SD_CARD
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1103_Luckfox_Pico_Mini
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  9. BoardConfig_IPC/BoardConfig-SD_CARD-Buildroot-RV1103_Luckfox_Pico_Plus-IPC.mk
-                               boot medium(启动介质): SD_CARD
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1103_Luckfox_Pico_Plus
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  10. BoardConfig_IPC/BoardConfig-SD_CARD-Buildroot-RV1103_Luckfox_Pico_WebBee-IPC.mk
-                               boot medium(启动介质): SD_CARD
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1103_Luckfox_Pico_WebBee
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  11. BoardConfig_IPC/BoardConfig-SD_CARD-Buildroot-RV1106_Luckfox_Pico_Pro_Max-IPC.mk
-                               boot medium(启动介质): SD_CARD
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_Pro_Max
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  12. BoardConfig_IPC/BoardConfig-SPI_NAND-Buildroot-RV1103_Luckfox_Pico_Mini-IPC.mk
-                               boot medium(启动介质): SPI_NAND
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1103_Luckfox_Pico_Mini
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  13. BoardConfig_IPC/BoardConfig-SPI_NAND-Buildroot-RV1103_Luckfox_Pico_Plus-IPC.mk
-                               boot medium(启动介质): SPI_NAND
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1103_Luckfox_Pico_Plus
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  14. BoardConfig_IPC/BoardConfig-SPI_NAND-Buildroot-RV1103_Luckfox_Pico_WebBee-IPC.mk
-                               boot medium(启动介质): SPI_NAND
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1103_Luckfox_Pico_WebBee
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  15. BoardConfig_IPC/BoardConfig-SPI_NAND-Buildroot-RV1106_Luckfox_Pico_Pro_Max-IPC.mk
-                               boot medium(启动介质): SPI_NAND
-                            system version(系统版本): Buildroot
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_Pro_Max
-                               application(应用场景): IPC
-  ----------------------------------------------------------------
-
-  ----------------------------------------------------------------
-  16. BoardConfig_IPC/BoardConfig-SPI_NAND-Busybox-RV1106_Luckfox_Pico_Pro_Max-IPC_FASTBOOT.mk
-                               boot medium(启动介质): SPI_NAND
-                            system version(系统版本): Busybox
-                          hardware version(硬件版本): RV1106_Luckfox_Pico_Pro_Max
-                               application(应用场景): IPC_FASTBOOT
-  ----------------------------------------------------------------
-  ```
-  Enter the corresponding board support file number to complete the configuration.
-#### Set Buildroot System Default WIFI Configuration
-* Navigate to the board-level configuration directory
-    ```shell
-    cd {SDK_PATH}/project/cfg/BoardConfig_IPC/
-    ```
-* Open the corresponding board-level configuration file
-* Modify the parameters LF_WIFI_PASSWD and LF_WIFI_SSID
-    ```shell
-    export LF_WIFI_SSID="Your wifi ssid"
-    export LF_WIFI_PSK="Your wifi password"
-    ```
-#### One-click Automatic Compilation
-```shell
-./build.sh lunch   # Select the reference board configuration
-./build.sh         # One-click automatic compilation
-```
-* Compile busybox/buildroot    
-    ```
-    ./build.sh lunch   # Select the reference board
-    ./build.sh         # One-click automatic compilation  
-    ``` 
-#### Build U-Boot
-```shell
-./build.sh clean uboot
-./build.sh uboot
-```
-The path of the generated files:
-```
-output/image/MiniLoaderAll.bin
-output/image/uboot.img
-```
-#### Build kernel
-```shell
-./build.sh clean kernel
-./build.sh kernel
-```
-The path of the generated files:
-```
-output/image/boot.img
-```
-#### Build rootfs
-```shell
-./build.sh clean rootfs
-./build.sh rootfs
-```
-* Note : After compilation, use the command ./build.sh firmware to repackage.
-
-#### Build media
-```shell
-./build.sh clean media
-./build.sh media
-```
-The path of the generated files:
-```
-output/out/media_out
-```
-* Note : After compilation, use the command ./build.sh firmware to repackage.
-#### Build Reference Applications
-```shell
-./build.sh clean app
+```bash
+# 编译所有 app（remote_control、rkipc、rproxyc 等）
 ./build.sh app
-```
-* Note 1: The app depends on media.
-* Note 2: After compilation, use the command ./build.sh firmware to repackage.
-#### Firmware Packaging
-```shell
+
+# 编译完成后打包 firmware
 ./build.sh firmware
 ```
-The path of the generated files:
-```
-output/image
-```
-#### Kernel Config
-```shell
-./build.sh kernelconfig
-```
-Open the menuconfig interface for the kernel.
-#### Buildroot Config
-```shell
-./build.sh buildrootconfig
-```
-Open the menuconfig interface for buildroot.
-* Note: This is only applicable when selecting buildroot as the root file system.
 
-## Notices
-When copying the source code package under Windows, the executable file under Linux may become a non-executable file, or the soft link fails and cannot be compiled and used.
-Therefore, please be careful not to copy the source code package under Windows.
+### 编译 rproxys（服务端，x86）
+
+```bash
+cd tools/rproxys
+make
+```
+
+### 编译输出
+
+编译完成后，固件输出到 `output/image/`：
+
+```
+output/image/
+├── update.img      # 完整升级包（推荐用于烧录）
+├── boot.img
+├── rootfs.img
+├── oem.img
+├── uboot.img
+├── trust.img
+├── parameter.txt
+└── download.bin
+```
+
+---
+
+## 烧录
+
+使用 **SocToolKit** 烧录固件：
+
+1. 将 Luckfox Pico Plus 通过 USB 连接电脑，进入 Maskrom 模式
+2. 打开 SocToolKit，选择 `output/image/` 目录下的固件镜像
+3. 点击烧录，等待完成即可
+
+---
+
+## 部署与运行
+
+### 设备端自动启动
+
+系统固件已配置 `remote_control` 开机自启动（通过 init 脚本 `S98remote_control`）：
+
+```
+/oem/usr/bin/remote_control   # 主程序路径
+```
+
+启动顺序：
+1. `rkipc` 视频服务启动（由系统 init 启动）
+2. `remote_control` 启动，初始化 PWM、TCP 服务端
+3. ML307C 模组拨号获取 IP
+4. 获取 IMEI 后自动启动 `rproxyc` 连接反向代理服务器
+
+### 服务端部署（rproxys）
+
+将 `tools/rproxys/proxy_server.tar.gz` 上传至云端 VPS（Ubuntu 24.04），解压后执行安装脚本：
+
+```bash
+tar xzf proxy_server.tar.gz
+cd proxy_server
+sudo ./install.sh
+```
+
+安装脚本自动完成以下操作：
+- 二进制文件安装至 `/usr/bin/rproxys`
+- 配置文件安装至 `/etc/rproxys.conf`（已有配置不会被覆盖）
+- 注册 systemd 服务，开机自启动
+
+安装完成后管理服务：
+
+```bash
+systemctl {start|stop|restart|status} rproxys
+```
+
+`rproxys` 会为每个接入设备分配 7 个端口：
+
+| 端口用途 | 说明 |
+|---------|------|
+| video0 | 主码流视频（H.265） |
+| video1 | 子码流视频（H.265） |
+| audio | 双向语音对讲 |
+| control | TCP/UDP 控制指令 |
+| videoCtrl | USB 摄像头视频 |
+| ssh | SSH 透传 |
+| rearCam | 后置摄像头 |
+
+### 客户端连接
+
+APP 端通过 rproxys 分配的端口连接设备，实现视频观看、车辆控制、语音对讲。
+
+---
+
+## 硬件说明
+
+本项目基于 Luckfox Pico Plus（RV1103）作为主控，搭配自研载板扩展以下硬件：
+
+| 硬件 | 型号/接口 | 说明 |
+|------|----------|------|
+| 主控 | RV1103（Luckfox Pico Plus） | ARM Cortex-A7, 64MB DDR2, SPI NAND |
+| 前摄像头 | SC3336（CSI） | 300W 像素，H.265 编码 |
+| 后摄像头 | USB 摄像头（UVC） | 可选，720P |
+| 4G 模组 | ML307C（UART） | 拨号上网、GPS、AT 指令控制 |
+| 电机驱动 | RZ7899-MS（PWM8/9） | 内置电调模式，支持正反转、倒车限速 |
+| 转向舵机 | 标准 PWM 舵机（PWM10） | 50Hz，500-2500us 脉宽 |
+| 灯光 | MOS 管控制（PWM11） | 亮度可调 |
+| 电池检测 | ADC 分压采集 | 每秒上报电压 |
+
+**载板硬件开源**：<https://oshwhub.com/qwiaoei/project_jzgihors>
+
+---
+
+## 配置说明
+
+### 视频配置（rkipc-300w.ini）
+
+关键配置项：
+
+```ini
+[video.source]
+enable_tcp_video = 1        # 启用 TCP 视频推流
+enable_npu = 0              # 禁用 AI（节省内存）
+
+[video.0]                   # 主码流
+width = 2304
+height = 1296
+
+[video.1]                   # 子码流
+width = 1280
+height = 720
+```
+
+### 控制参数（remote_control）
+
+| 参数 | 值 | 说明 |
+|------|----|------|
+| TCP 端口 | 5103 | 控制指令接收端口 |
+| 电机 PWM 频率 | 1000Hz | 内置电调模式 |
+| 前进最大占空比 | 512 | 全速前进 |
+| 倒车最大占空比 | 150 | 限速保护 |
+| 舵机脉宽范围 | 500-2500us | 标准 50Hz 舵机信号 |
+| 油门曲线 | 二次方 S 曲线 | 精细化低速控制 |
+
+---
+
+## 许可证
+
+本项目基于 Luckfox Pico SDK 修改，遵循原 SDK 许可协议。  
+硬件设计开源，详见 [嘉立创开源广场](https://oshwhub.com/qwiaoei/project_jzgihors)。
