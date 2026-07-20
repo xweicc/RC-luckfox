@@ -98,7 +98,7 @@ static uint8_t pcm_to_alaw(int16_t pcm_val) {
     if (seg == 0) {
         mantissa = (pcm >> 4) & 0x0F;
     } else {
-        mantissa = (pcm >> (seg + 1)) & 0x0F;
+        mantissa = (pcm >> (seg + 3)) & 0x0F;
     }
 
     int aval = (seg << 4) | mantissa;

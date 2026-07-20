@@ -39,8 +39,13 @@ function remove_data()
     # png
     lf_rm $RK_PROJECT_PACKAGE_OEM_DIR/usr/lib/libpng*
 
-    # vqefiles
-    lf_rm $RK_PROJECT_PACKAGE_OEM_DIR/usr/share/vqefiles/*
+    # vqefiles: 保留 config_aivqe.json（AEC/ANR/AGC 需要），删除其余
+    for f in $RK_PROJECT_PACKAGE_OEM_DIR/usr/share/vqefiles/*; do
+        case "$(basename $f)" in
+            config_aivqe.json) ;;
+            *) lf_rm "$f" ;;
+        esac
+    done
 
     # ko
     lf_rm $RK_PROJECT_PACKAGE_OEM_DIR/usr/ko/phy-rockchip-csi2-dphy-hw.ko

@@ -453,13 +453,13 @@ static int get_imei(void)
 static int rndis_dial(void)
 {
     if (at_ok_worker("AT+MDIALUPCFG=\"mode\",0\r\n", AT_TIMEOUT_MS) < 0) {
-        Printf("[ML307C] set RNDIS mode failed\n");
+        Printf("[ML307C] set RNDIS mode failed, response: %s\n", g_at_resp[0] ? g_at_resp : "(empty)");
         return -1;
     }
 
     int n = at_send_worker("AT+MDIALUP=1,1\r\n", AT_DIAL_TIMEOUT_MS);
     if (n < 0 || !resp_has_ok(g_at_resp)) {
-        Printf("[ML307C] dial failed\n");
+        Printf("[ML307C] dial failed, response: %s\n", g_at_resp[0] ? g_at_resp : "(empty)");
         return -1;
     }
 

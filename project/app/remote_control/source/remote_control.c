@@ -621,6 +621,9 @@ static int tcp_init(void)
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { Printf("socket: %s\n", strerror(errno)); return -1; }
 
+    /* FD_CLOEXEC: 防止 system()/fork+exec 子进程继承监听 socket 导致端口泄漏占用 */
+    { int fl = fcntl(fd, F_GETFD, 0); if (fl != -1) fcntl(fd, F_SETFD, fl | FD_CLOEXEC); }
+
     /* Allow socket reuse for quick restart */
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -657,6 +660,9 @@ static int udp_init(void)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) { Printf("UDP socket: %s\n", strerror(errno)); return -1; }
+
+    /* FD_CLOEXEC: 防止 system()/fork+exec 子进程继承 socket 导致端口泄漏占用 */
+    { int fl = fcntl(fd, F_GETFD, 0); if (fl != -1) fcntl(fd, F_SETFD, fl | FD_CLOEXEC); }
 
     /* Allow socket reuse */
     int opt = 1;
